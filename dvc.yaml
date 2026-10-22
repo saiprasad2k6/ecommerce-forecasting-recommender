@@ -1,0 +1,18 @@
+stages:
+  download:
+    cmd: python scripts/download_olist_data.py
+    outs:
+      - data/raw
+  validate:
+    cmd: python scripts/validate_olist_data.py
+    deps:
+      - data/raw
+      - scripts/validate_olist_data.py
+  train:
+    cmd: python scripts/train_models.py
+    deps:
+      - data/raw
+      - src/ecommerce_forecasting_recommender
+    outs:
+      - data/processed
+      - models

@@ -1,0 +1,12 @@
+app:
+  name: ecommerce-forecasting-recommender
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  reference_dir: data/reference
+models:
+  forecast_model_path: models/forecast_model.pkl
+  recommender_model_path: models/recommender.pkl
+monitoring:
+  drift_output_path: artifacts/drift_report.json
+  retraining_threshold: 0.2
