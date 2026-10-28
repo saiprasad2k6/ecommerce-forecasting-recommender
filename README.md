@@ -107,6 +107,28 @@ Every worker needs access to the same checkout and data directories. For another
 
 This DAG does not reset existing files or run at import time. Stop Airflow before using the reset utilities, since the local development Airflow database and logs are under `data/airflow/`.
 
+## View MLflow runs in the browser
+
+After running the baseline programs or the Airflow pipeline, open a new terminal in the repository root and start MLflow with the same tracking database used by the pipeline:
+
+```bash
+.venv/bin/mlflow server \
+  --backend-store-uri sqlite:///data/baselines/mlflow.db \
+  --host 127.0.0.1 \
+  --port 5001
+```
+
+Open [http://localhost:5001](http://localhost:5001) and select an experiment:
+
+- **`ecommerce-demand-forecasting`**: forecasting baseline runs.
+- **`ecommerce-recommendations`**: recommendation baseline runs.
+
+Click a run to inspect its parameters, validation/test metrics, tags and saved CSV artifacts. Select multiple runs and click **Compare** to compare their performance.
+
+Keep the terminal running while using the UI; press **Ctrl+C** to stop the MLflow server. Airflow remains available separately at [http://localhost:8080](http://localhost:8080). If port 5001 is already occupied, choose another port and use that port in the browser URL.
+
+If the experiment list is empty, confirm that baseline evaluation has finished and that the server was started from the repository root with `data/baselines/mlflow.db` as its backend store. Starting MLflow against another database will show different runs.
+
 ## Reset local pipeline outputs
 
 To remove only local data and databases, use:
