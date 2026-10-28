@@ -1,0 +1,71 @@
+# Human-readable specification. Validation code must enforce these rules.
+name: order_items
+version: "1.0.0"
+source: data/raw/olist_order_items_dataset.csv
+owner: data_pipeline
+grain: One individual item within an order
+primary_key:
+  - order_id
+  - order_item_id
+
+columns:
+  order_id:
+    type: string
+    nullable: false
+    nonempty: true
+    references: orders.order_id
+  order_item_id:
+    type: integer
+    nullable: false
+    minimum: 1
+  product_id:
+    type: string
+    nullable: false
+    nonempty: true
+    references: products.product_id
+  seller_id:
+    type: string
+    nullable: false
+    nonempty: true
+    references: sellers.seller_id
+  shipping_limit_date:
+    type: timestamp
+    nullable: false
+    format: "%Y-%m-%d %H:%M:%S"
+    timezone_policy: Preserve source timezone-naive values; do not assume UTC
+  price:
+    type: decimal
+    nullable: false
+    minimum: 0
+    finite: true
+    currency: BRL
+  freight_value:
+    type: decimal
+    nullable: false
+    minimum: 0
+    finite: true
+    currency: BRL
+
+failure_policy:
+  missing_required_column: fail_batch
+  unexpected_column: warn
+  duplicate_primary_key: fail_batch
+  invalid_row: quarantine
+  missing_reference: quarantine
+  # Initial conservative gate: review and version any future relaxation.
+  max_rejected_row_fraction: 0.0
+
+quarantine_metadata:
+  - source_file
+  - source_row_number
+  - dataset_version
+  - contract_version
+  - failure_reason
+
+failure_policy:
+  missing_required_column: fail_batch
+  unexpected_column: warn
+  duplicate_primary_key: fail_batch
+  invalid_row: quarantine
+  missing_reference: quarantine
+  max_rejected_row_fraction: 0.0

@@ -1,0 +1,15 @@
+# Dependencies for simple_baselines.ipynb (Python 3.12).
+# Install from the repository root:
+#   .venv/bin/python -m pip install -r notebooks/requirements.txt
+
+# Versions used to execute the baseline calculations.
+duckdb==1.4.2
+numpy==2.5.4
+pandas==3.0.6
+pyarrow==25.0.1
+mlflow==3.17.2
+nbformat==5.11.1
+
+# Interactive notebook interface and Python kernel.
+ipykernel>=6.29,<8
+jupyterlab>=4,<5

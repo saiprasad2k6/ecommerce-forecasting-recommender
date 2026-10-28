@@ -1,0 +1,20 @@
+required_files:
+  - olist_orders_dataset.csv
+  - olist_order_items_dataset.csv
+  - olist_customers_dataset.csv
+  - olist_products_dataset.csv
+required_columns:
+  olist_orders_dataset.csv:
+    - order_id
+    - customer_id
+    - order_purchase_timestamp
+  olist_order_items_dataset.csv:
+    - order_id
+    - product_id
+    - order_item_id
+  olist_customers_dataset.csv:
+    - customer_id
+    - customer_unique_id
+  olist_products_dataset.csv:
+    - product_id
+    - product_category_name
