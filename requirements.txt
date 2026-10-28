@@ -1,3 +1,6 @@
+# Project dependencies for Python 3.12: scripts, pipelines, tests and notebooks.
+# Install with: python -m pip install -r requirements.txt
+
 a2wsgi==1.10.10
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.5
@@ -257,3 +260,14 @@ xgboost==3.4.1
 yarl==1.25.1
 zc.lockfile==4.0
 zipp==4.1.2
+
+# Notebook display, kernel, browser interface and execution support.
+# Exact versions below match the project environment where installed.
+ipython==9.17.1
+ipykernel==7.4.0
+nbformat==5.11.1
+jupyterlab>=4,<5
+nbclient>=0.10,<1
+
+# Notebook progress widgets used by libraries such as tqdm.
+ipywidgets>=8,<9

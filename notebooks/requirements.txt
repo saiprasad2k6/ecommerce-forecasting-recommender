@@ -1,4 +1,5 @@
-# Dependencies for simple_baselines.ipynb (Python 3.12).
+# Lightweight dependencies for all baseline notebooks (Python 3.12).
+# The repository root requirements.txt also includes these dependencies.
 # Install from the repository root:
 #   .venv/bin/python -m pip install -r notebooks/requirements.txt
 
@@ -11,5 +12,8 @@ mlflow==3.17.2
 nbformat==5.11.1
 
 # Interactive notebook interface and Python kernel.
-ipykernel>=6.29,<8
+ipython==9.17.1
+ipykernel==7.4.0
 jupyterlab>=4,<5
+nbclient>=0.10,<1
+ipywidgets>=8,<9
