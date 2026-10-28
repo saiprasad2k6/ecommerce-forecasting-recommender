@@ -10,6 +10,6 @@ with DAG(
     schedule="@daily",
     catchup=False,
 ) as dag:
-    download = BashOperator(task_id="download_sample", bash_command="python scripts/download_olist_data.py")
-    validate = BashOperator(task_id="validate_data", bash_command="python scripts/validate_olist_data.py")
+    download = BashOperator(task_id="download_sample", bash_command="python scripts/data/download_olist_data.py")
+    validate = BashOperator(task_id="validate_data", bash_command="python scripts/data/validate_olist_data.py")
     download >> validate

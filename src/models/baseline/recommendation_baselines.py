@@ -27,7 +27,7 @@ import duckdb
 import mlflow
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 WAREHOUSE = ROOT / "data" / "warehouse" / "olist.duckdb"
 BASELINES = ROOT / "data" / "baselines"
 DEFAULT_TRACKING_URI = f"sqlite:///{BASELINES / 'mlflow.db'}"
