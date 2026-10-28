@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from scripts.build_recommendation_features import build_candidates, load_history
+from src.features.build_recommendation_features import build_candidates, load_history
 
 
 class RecommendationTests(unittest.TestCase):

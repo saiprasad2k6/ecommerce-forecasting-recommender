@@ -220,7 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 
-data/
+/data/
 documents/*
 
 # Local MLflow run artifacts
