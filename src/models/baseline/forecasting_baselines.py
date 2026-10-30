@@ -25,8 +25,8 @@ from typing import Any
 os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
 import duckdb
 import mlflow
-import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
 ROOT = Path(__file__).resolve().parents[3]
 FEATURES = ROOT / "data" / "features" / "forecasting"
@@ -65,23 +65,13 @@ class BaselineForecaster:
         return df[self.feature_col].fillna(0.0).rename("forecast")
 
     def evaluate(self, df: pd.DataFrame, target_col: str = "demand") -> dict[str, float]:
-        """Compute retail forecasting metrics against actual demand."""
+        """Compute MAE and RMSE against actual demand."""
         preds = self.predict(df)
         actuals = df[target_col]
-        abs_err = (actuals - preds).abs()
-        mae = float(abs_err.mean())
-        rmse = float(np.sqrt(((actuals - preds) ** 2).mean()))
-        wape = float(abs_err.sum() / actuals.sum()) if actuals.sum() > 0 else 0.0
-        pos_mask = actuals > 0
-        pos_mae = float(abs_err[pos_mask].mean()) if pos_mask.any() else 0.0
-        zero_fraction = float((actuals == 0).mean())
         return {
             "method": self.method,
-            "mae": mae,
-            "rmse": rmse,
-            "wape": wape,
-            "positive_demand_mae": pos_mae,
-            "zero_demand_fraction": zero_fraction,
+            "mae": float(mean_absolute_error(actuals, preds)),
+            "rmse": float(root_mean_squared_error(actuals, preds)),
         }
 
 
@@ -108,10 +98,7 @@ def evaluate_baselines_duckdb(parquet_path: Path, split_name: str) -> pd.DataFra
         baseline,
         COUNT(*) AS total_rows,
         AVG(ABS(actual - pred)) AS mae,
-        SQRT(AVG(POWER(actual - pred, 2))) AS rmse,
-        SUM(ABS(actual - pred)) / NULLIF(SUM(actual), 0) AS wape,
-        AVG(ABS(actual - pred)) FILTER (WHERE actual > 0) AS positive_demand_mae,
-        AVG(CASE WHEN actual = 0 THEN 1.0 ELSE 0.0 END) AS zero_demand_fraction
+        SQRT(AVG(POWER(actual - pred, 2))) AS rmse
     FROM (
         SELECT actual, last_day AS pred, 'last_day' AS baseline FROM base
         UNION ALL
@@ -227,9 +214,6 @@ def run_baseline_pipeline(
                 mlflow.log_metrics({
                     f"{split_name}_mae": float(row["mae"]),
                     f"{split_name}_rmse": float(row["rmse"]),
-                    f"{split_name}_wape": float(row["wape"]),
-                    f"{split_name}_positive_mae": float(row["positive_demand_mae"]),
-                    f"{split_name}_zero_fraction": float(row["zero_demand_fraction"]),
                 })
 
             # Artifacts
@@ -245,7 +229,6 @@ def run_baseline_pipeline(
                 "baseline": baseline,
                 "run_id": run.info.run_id,
                 "val_mae": float(val_metrics.loc[val_metrics["baseline"] == baseline, "mae"].iloc[0]),
-                "val_wape": float(val_metrics.loc[val_metrics["baseline"] == baseline, "wape"].iloc[0]),
                 "val_rmse": float(val_metrics.loc[val_metrics["baseline"] == baseline, "rmse"].iloc[0]),
                 "champion": is_champion,
             })
@@ -254,7 +237,7 @@ def run_baseline_pipeline(
         "status": "success",
         "champion_baseline": champion_baseline,
         "champion_val_mae": float(val_metrics.loc[val_metrics["baseline"] == champion_baseline, "mae"].iloc[0]),
-        "champion_val_wape": float(val_metrics.loc[val_metrics["baseline"] == champion_baseline, "wape"].iloc[0]),
+        "champion_val_rmse": float(val_metrics.loc[val_metrics["baseline"] == champion_baseline, "rmse"].iloc[0]),
         "runs": logged_runs,
         "metrics_csv": str(metrics_csv),
     }
@@ -293,7 +276,7 @@ def main() -> int:
     print("\n" + "=" * 70)
     print(f"🏆 CHAMPION BASELINE: '{results['champion_baseline']}'")
     print(f"   Validation MAE:  {results['champion_val_mae']:.6f}")
-    print(f"   Validation WAPE: {results['champion_val_wape']:.4f}")
+    print(f"   Validation RMSE: {results['champion_val_rmse']:.6f}")
     print("=" * 70)
     print(f"Summary metrics saved to: {results['metrics_csv']}")
     print(f"Tracked in MLflow experiment: {args.experiment_name}")

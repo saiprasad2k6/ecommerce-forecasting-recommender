@@ -2,7 +2,7 @@
 """Product Recommendation Baseline Models & MLflow Tracking Pipeline.
 
 Implements three classical e-commerce recommendation baseline strategies,
-offline ranking metrics (Precision@K, Recall@K, HitRate@K, NDCG@K),
+offline recommendation metrics (Precision@K and Recall@K),
 cold-start cohort breakdown (Warm vs. New customers), and MLflow tracking
 under the dedicated experiment 'ecommerce-recommendations'.
 
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 from pathlib import Path
@@ -119,16 +118,13 @@ def prepare_recommender(history: pd.DataFrame, cutoff: pd.Timestamp):
 
 
 def ranking_metrics(recommendations: list[str], relevant: set[str], k: int) -> dict[str, float]:
-    """Compute Precision@K, Recall@K, HitRate@K, and NDCG@K."""
-    recommendations = recommendations[:k]
-    hits = [int(p in relevant) for p in recommendations]
-    dcg = sum(hit / math.log2(position + 2) for position, hit in enumerate(hits))
-    ideal = sum(1 / math.log2(position + 2) for position in range(min(k, len(relevant))))
+    """Compute the fraction of recommendations and purchases matched at K."""
+    if k < 1:
+        raise ValueError("k must be positive")
+    hits = len(set(recommendations[:k]) & relevant)
     return {
-        "precision_at_k": sum(hits) / k,
-        "recall_at_k": sum(hits) / len(relevant) if relevant else 0.0,
-        "hit_rate_at_k": float(any(hits)),
-        "ndcg_at_k": dcg / ideal if ideal else 0.0,
+        "precision_at_k": hits / k,
+        "recall_at_k": hits / len(relevant) if relevant else 0.0,
     }
 
 
@@ -174,16 +170,12 @@ def run_recommendation_pipeline(
 
         truths = labels.groupby("customer_unique_id").product_id.agg(set).to_dict()
         known_customers = set(history.customer_unique_id)
-        catalog_ids = set(history.product_id)
-        label_catalog_coverage = float(labels.product_id.isin(catalog_ids).mean())
 
         for method in methods:
             records: list[dict[str, Any]] = []
-            recommended_catalog: set[str] = set()
 
             for customer, relevant in truths.items():
                 products = recommend(customer, method, k)
-                recommended_catalog.update(products)
                 is_warm = customer in known_customers
 
                 scores = ranking_metrics(products, relevant, k)
@@ -208,8 +200,6 @@ def run_recommendation_pipeline(
                 **overall,
                 "customers": len(scores_df),
                 "warm_customers": int(scores_df.cohort.eq("warm").sum()),
-                "catalog_coverage": len(recommended_catalog) / len(catalog_ids) if catalog_ids else 0.0,
-                "label_catalog_coverage": label_catalog_coverage,
             })
 
             for cohort, group in scores_df.groupby("cohort"):
@@ -233,9 +223,11 @@ def run_recommendation_pipeline(
     cohorts_df.to_csv(cohorts_csv, index=False)
     example_df.to_csv(example_csv, index=False)
 
-    # Champion selection on validation NDCG@K
+    # Champion selection on validation recall, then precision.
     val_subset = metrics_df.query("split == 'validation'")
-    champion_baseline = val_subset.sort_values("ndcg_at_k", ascending=False).iloc[0]["baseline"]
+    champion_baseline = val_subset.sort_values(
+        ["recall_at_k", "precision_at_k", "baseline"], ascending=[False, False, True]
+    ).iloc[0]["baseline"]
 
     # MLflow Tracking
     mlflow.set_tracking_uri(tracking_uri)
@@ -273,27 +265,9 @@ def run_recommendation_pipeline(
                 row = metrics_df.loc[(metrics_df["baseline"] == method) & (metrics_df["split"] == split)].iloc[0]
 
                 mlflow.log_metrics({
-                    f"{split_prefix}_ndcg_at_k": float(row["ndcg_at_k"]),
                     f"{split_prefix}_recall_at_k": float(row["recall_at_k"]),
                     f"{split_prefix}_precision_at_k": float(row["precision_at_k"]),
-                    f"{split_prefix}_hit_rate_at_k": float(row["hit_rate_at_k"]),
-                    f"{split_prefix}_catalog_coverage": float(row["catalog_coverage"]),
-                    f"{split_prefix}_customers": int(row["customers"]),
-                    f"{split_prefix}_warm_customers": int(row["warm_customers"]),
                 })
-
-                for cohort in ["warm", "new"]:
-                    cohort_match = cohorts_df.loc[
-                        (cohorts_df["baseline"] == method)
-                        & (cohorts_df["split"] == split)
-                        & (cohorts_df["cohort"] == cohort)
-                    ]
-                    if not cohort_match.empty:
-                        c_row = cohort_match.iloc[0]
-                        mlflow.log_metrics({
-                            f"{split_prefix}_{cohort}_ndcg_at_k": float(c_row["ndcg_at_k"]),
-                            f"{split_prefix}_{cohort}_recall_at_k": float(c_row["recall_at_k"]),
-                        })
 
             # Artifacts
             mlflow.log_artifact(str(metrics_csv))
@@ -303,7 +277,7 @@ def run_recommendation_pipeline(
             logged_runs.append({
                 "baseline": method,
                 "run_id": run.info.run_id,
-                "val_ndcg_at_k": float(val_subset.loc[val_subset["baseline"] == method, "ndcg_at_k"].iloc[0]),
+                "val_precision_at_k": float(val_subset.loc[val_subset["baseline"] == method, "precision_at_k"].iloc[0]),
                 "val_recall_at_k": float(val_subset.loc[val_subset["baseline"] == method, "recall_at_k"].iloc[0]),
                 "champion": is_champion,
             })
@@ -311,7 +285,7 @@ def run_recommendation_pipeline(
     return {
         "status": "success",
         "champion_baseline": champion_baseline,
-        "champion_val_ndcg": float(val_subset.loc[val_subset["baseline"] == champion_baseline, "ndcg_at_k"].iloc[0]),
+        "champion_val_precision": float(val_subset.loc[val_subset["baseline"] == champion_baseline, "precision_at_k"].iloc[0]),
         "champion_val_recall": float(val_subset.loc[val_subset["baseline"] == champion_baseline, "recall_at_k"].iloc[0]),
         "runs": logged_runs,
         "metrics_csv": str(metrics_csv),
@@ -348,12 +322,12 @@ def main() -> int:
     )
 
     print("\nLeaderboard Summary:")
-    runs_df = pd.DataFrame(results["runs"]).sort_values("val_ndcg_at_k", ascending=False).reset_index(drop=True)
+    runs_df = pd.DataFrame(results["runs"]).sort_values("val_recall_at_k", ascending=False).reset_index(drop=True)
     print(runs_df.to_string(index=False))
 
     print("\n" + "=" * 70)
     print(f"🏆 CHAMPION BASELINE: '{results['champion_baseline']}'")
-    print(f"   Validation NDCG@{args.top_k}: {results['champion_val_ndcg']:.6f}")
+    print(f"   Validation Precision@{args.top_k}: {results['champion_val_precision']:.6f}")
     print(f"   Validation Recall@{args.top_k}: {results['champion_val_recall']:.6f}")
     print("=" * 70)
     print(f"Summary metrics saved to: {results['metrics_csv']}")

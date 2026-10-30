@@ -85,7 +85,26 @@ with tempfile.TemporaryDirectory() as directory:
     for task_id in ['run_forecasting_baselines', 'run_recommendation_baselines']:
         args = records[task_id]
         assert args[args.index('--tracking-uri') + 1] == f'sqlite:///{root / "data/baselines/mlflow.db"}'
-    print('DAG imports, task order, parameter validation and all eight shell commands verified')
+    training_bag = DagBag(dag_folder=str(root / 'pipelines/training_pipeline.py'))
+    assert not training_bag.import_errors, training_bag.import_errors
+    training = training_bag.dags['olist_production_training']
+    training_order = ['validate_training_inputs', 'train_forecasting_model', 'train_recommendation_model']
+    assert [task.task_id for task in training.topological_sort()] == training_order
+    assert training.max_active_runs == 1 and training.max_active_tasks == 1
+    assert training.schedule is None
+    training_params = training.params.validate()
+    training_params.update(max_train_rows=1000, forecast_estimators=5, ranking_estimators=5)
+    for task in training.topological_sort():
+        task.render_template_fields({'params': training_params})
+        record_file = temporary / (task.task_id + '.json')
+        subprocess.run(['bash', '-c', task.bash_command], cwd=task.cwd,
+                       env={**os.environ, **task.env, 'TEST_RECORD_FILE': str(record_file)},
+                       check=True, capture_output=True, text=True)
+        args = json.loads(record_file.read_text())
+        assert Path(args[0]).is_file()
+        if task.task_id == 'train_forecasting_model':
+            assert args[args.index('--max-train-rows') + 1] == '1000'
+    print('Both DAGs, dependencies, parameter validation and shell commands verified')
 '''
         result = subprocess.run([sys.executable, "-c", check], cwd=root,
                                 capture_output=True, text=True, timeout=60)

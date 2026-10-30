@@ -221,6 +221,7 @@ __marimo__/
 
 
 /data/
+/models/
 documents/*
 
 # Local MLflow run artifacts
