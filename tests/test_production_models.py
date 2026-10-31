@@ -227,6 +227,48 @@ class ProductionModelTests(unittest.TestCase):
                     "test_precision_at_k", "test_recall_at_k",
                 })
 
+    def test_ranker_stops_after_twenty_rounds_without_validation_improvement(self):
+        # Constant features make validation precision plateau, so the callback must stop.
+        features = pd.DataFrame(0.0, index=range(40), columns=recommendation.NUMERIC_FEATURES)
+        train = (features, np.tile([1, 0, 0, 0], 10), [4] * 10)
+        validation = (features.copy(), np.tile([0, 0, 0, 1], 10), [4] * 10)
+        model = recommendation.train_model(train, validation, n_estimators=100, top_k=3)
+        estimator = model.estimator
+        self.assertEqual(estimator.best_iteration_, 1)
+        self.assertEqual(len(estimator.evals_result_["validation"]["precision_at_k"]), 21)
+        self.assertEqual(set(estimator.best_score_), {"validation"})
+        self.assertEqual(set(estimator.best_score_["validation"]), {"precision_at_k"})
+        self.assertEqual(estimator.best_score_["validation"]["precision_at_k"], 0.0)
+
+    def test_ranker_early_stopping_precision_averages_customers_equally(self):
+        features = pd.DataFrame(0.0, index=range(6), columns=recommendation.NUMERIC_FEATURES)
+        data = (features, np.array([1, 0, 1, 1, 0, 0]), [2, 4])
+        validation = (features.copy(), data[1].copy(), [2, 4])
+        model = recommendation.train_model(data, validation, n_estimators=25, top_k=2)
+        # With tied scores: first customer's precision is 1/2, second's is 2/2.
+        self.assertAlmostEqual(model.estimator.best_score_["validation"]["precision_at_k"], 0.75)
+
+    def test_ranker_validation_excludes_test_purchases_and_late_deliveries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            warehouse = Path(directory) / "olist.duckdb"
+            warehouse_fixture(warehouse)
+            start, end = pd.Timestamp("2018-07-01"), pd.Timestamp("2018-08-01")
+            original = recommendation.prepare_data(warehouse, start, end, candidate_limit=5)
+            with duckdb.connect(str(warehouse)) as db:
+                db.execute("""UPDATE order_items SET product_id = 'future-product'
+                              WHERE order_purchase_timestamp >= TIMESTAMP '2018-08-01'""")
+            unchanged = recommendation.prepare_data(warehouse, start, end, candidate_limit=5)
+            pd.testing.assert_frame_equal(original[0], unchanged[0])
+            np.testing.assert_array_equal(original[1], unchanged[1])
+            self.assertEqual(original[2], unchanged[2])
+            with duckdb.connect(str(warehouse)) as db:
+                db.execute("""UPDATE order_items SET order_delivered_customer_date = TIMESTAMP '2018-08-02'
+                              WHERE customer_unique_id = 'c0'
+                                AND order_purchase_timestamp >= TIMESTAMP '2018-07-01'
+                                AND order_purchase_timestamp < TIMESTAMP '2018-08-01'""")
+            _, _, groups = recommendation.prepare_data(warehouse, start, end, candidate_limit=5)
+            self.assertEqual(len(groups), len(original[2]) - 1)
+
     def test_recommendation_training_retrieval_and_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -249,6 +291,9 @@ class ProductionModelTests(unittest.TestCase):
             self.assertTrue(cold.days_since_purchase.eq(-1).all())
             self.assertFalse((root / "model.pkl").exists())
             model = joblib.load(Path(report["output_dir"]) / "model.pkl")
+            self.assertIn("precision_at_k", model.estimator.best_score_["validation"])
+            self.assertGreater(model.estimator.best_iteration_, 0)
+            self.assertEqual(report["params"]["early_stopping_metric"], "precision_at_k")
             products = model.predict(snapshot, "c1", 3)
             self.assertEqual(len(products), len(set(products)))
             self.assertTrue(set(products).issubset(snapshot.catalog))

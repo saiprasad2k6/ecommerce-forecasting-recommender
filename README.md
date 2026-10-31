@@ -134,8 +134,9 @@ the completed runs, `compare_model_results()` selects and checks the candidate, 
 Both models default to **100 trees** (`--n-estimators`) and **seed 42** (`--seed`).
 The estimator constructors specify the task objective, evaluation metric, tree count,
 seed and two CPU threads. Advanced tree and regularization settings use LightGBM defaults.
-Forecasting can stop early based on validation MAE; recommendations train for the
-configured tree count. The same defaults are used by the Airflow DAG.
+Both models can stop early after 20 rounds without validation improvement:
+forecasting monitors MAE, and recommendations monitor Precision@K.
+The tree count is an upper limit. The same defaults are used by the Airflow DAG.
 
 | Program | Purpose |
 |---|---|
@@ -202,7 +203,8 @@ settings to both recommendation jobs.
 - Candidates come from global popularity, recent customer categories and purchase history. Future purchased products are never injected into candidate lists. Repeat purchases are eligible for both ranker and baselines.
 - Training omits groups without positive/negative candidate variation because they supply no pairwise ranking signal. Evaluation retains all purchasing customers, including new customers and purchases outside the candidate/catalog pool.
 - Recommendation baselines and production models report only **Precision@K** (the fraction of recommendations purchased) and **Recall@K** (the fraction of purchases included in the recommendations). Higher is better. Both model and baselines use the same customers and delivery-outcome boundaries.
-- The ranker trains for the configured `ranking_estimators` rounds. Validation selects the baseline by Recall@K, with Precision@K as a tiebreaker; test checks the frozen model. Forecasting still uses early stopping, monitoring MAE.
+- The ranker uses monthly validation ranking groups for early stopping, with historical features built before each snapshot and delivery outcomes known before the test cutoff. It monitors Precision@K and stops after 20 rounds without improvement, up to `ranking_estimators` rounds. Training and early-stopping groups require both positive and negative candidates; final evaluation still includes all purchasing customers.
+- Precision@K is supplied to LightGBM through a small evaluation callback because it is not a built-in ranking metric. MLflow performance metrics remain Precision@K and Recall@K; parameters record the stopping metric, patience and trained tree count. Validation selects the baseline by Recall@K, with Precision@K as a tiebreaker; test checks the frozen model and is not passed to `fit()`.
 - Inventory, recalls, views, brands and promotions are not supplied by Olist and are not fabricated.
 
 ### Model files and release checks

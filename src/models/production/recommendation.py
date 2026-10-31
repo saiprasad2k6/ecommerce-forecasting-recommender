@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-from lightgbm import LGBMRanker
+from lightgbm import LGBMRanker, early_stopping
 import numpy as np
 import pandas as pd
 from src.models.baseline.recommendation_baselines import METHODS as BASELINES, predict_baseline
@@ -31,17 +31,17 @@ class ProductionRecommender:
     recommend = predict  # Keep existing saved-model examples working.
 
 
-def prepare_data(warehouse, start, validation_start, candidate_limit=100):
-    """For each month, use earlier history to predict that month's purchases."""
+def prepare_data(warehouse, start, end, candidate_limit=100):
+    """Build monthly ranking groups with purchase outcomes known before end."""
     frames, targets, groups = [], [], []
-    boundaries = pd.date_range(start, validation_start, freq=pd.DateOffset(months=1))
-    boundaries = boundaries.union(pd.DatetimeIndex([validation_start]))
+    boundaries = pd.date_range(start, end, freq=pd.DateOffset(months=1))
+    boundaries = boundaries.union(pd.DatetimeIndex([end]))
     for cutoff, label_end in zip(boundaries[:-1], boundaries[1:]):
         history = load_history(warehouse, cutoff)
         snapshot = RecommendationSnapshot(history, cutoff, candidate_limit)
-        labels = _load_labels(warehouse, cutoff, label_end, validation_start)
+        labels = _load_labels(warehouse, cutoff, label_end, end)
         for customer, relevant in labels.groupby("customer_unique_id").product_id.agg(set).items():
-            frame = snapshot.prepare_features(customer)
+            frame = snapshot.prepare_features(customer).sort_index()
             target = frame.index.isin(relevant).astype("int32")
             # A ranking group needs both purchased and unpurchased candidates.
             if target.any() and not target.all():
@@ -50,20 +50,38 @@ def prepare_data(warehouse, start, validation_start, candidate_limit=100):
                 groups.append(len(frame))
     if not frames:
         raise ValueError(
-            "No informative ranking groups; increase candidates or extend training dates"
+            "No informative ranking groups; increase candidates or extend the date range"
         )
     return pd.concat(frames, ignore_index=True), np.asarray(targets), groups
 
 
-def train_model(train, targets, groups, n_estimators=100, seed=42):
-    """Fit a ranker; each group contains one customer's candidate products."""
+def train_model(train, validation, n_estimators=100, seed=42, top_k=10):
+    """Fit the ranker, stopping when validation Precision@K stops improving."""
     if n_estimators < 1:
         raise ValueError("n-estimators must be positive")
+    features, targets, groups = train
+    validation_features, validation_targets, validation_groups = validation
+
+    def validation_precision(actual, predicted, weight, group):
+        # Rows are grouped by customer and sorted by product ID to break score ties.
+        scores, start = [], 0
+        for size in group:
+            stop = start + size
+            top = np.argsort(-predicted[start:stop], kind="stable")[:top_k]
+            scores.append(actual[start:stop][top].sum() / top_k)
+            start = stop
+        return "precision_at_k", float(np.mean(scores)), True
+
     estimator = LGBMRanker(
         objective="lambdarank", metric="None", n_estimators=n_estimators,
         random_state=seed, n_jobs=2, verbosity=-1,
     )
-    estimator.fit(train, targets, group=groups)
+    estimator.fit(
+        features, targets, group=groups,
+        eval_X=validation_features, eval_y=validation_targets,
+        eval_group=[validation_groups], eval_names=["validation"], eval_metric=validation_precision,
+        callbacks=[early_stopping(20, verbose=False)],
+    )
     return ProductionRecommender(estimator)
 
 
@@ -84,7 +102,8 @@ def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT
         raise ValueError("Require 1 <= top-k <= candidate-limit")
     context = recommendation_context(warehouse, validation_start, test_start, end, candidate_limit, top_k)
     train, targets, groups = prepare_data(warehouse, start, validation_start, candidate_limit)
-    model = train_model(train, targets, groups, n_estimators, seed)
+    validation = prepare_data(warehouse, validation_start, test_start, candidate_limit)
+    model = train_model((train, targets, groups), validation, n_estimators, seed, top_k)
     scores = {}
     for split, cutoff, stop in [("validation", validation_start, test_start), ("test", test_start, end)]:
         snapshot = RecommendationSnapshot(load_history(warehouse, cutoff), cutoff, candidate_limit)
@@ -96,7 +115,8 @@ def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT
               **scores, "evaluation_context": context}
     params = {"training_start": str(start.date()), "training_rows": len(train), "training_groups": len(groups),
               "seed": seed, "n_estimators": n_estimators, "trained_estimators": model.estimator.n_estimators_,
-              "k": top_k, "candidate_limit": candidate_limit}
+              "k": top_k, "candidate_limit": candidate_limit,
+              "early_stopping_metric": "precision_at_k", "early_stopping_rounds": 20}
     return save_run(model, report, params, output_dir, tracking_uri, "ecommerce-recommendations", pipeline_run_id)
 
 
