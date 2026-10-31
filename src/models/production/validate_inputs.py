@@ -7,7 +7,8 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.models.production.common import ROOT, sql_path
+from src.models.evaluation import sql_path
+from src.models.production.common import ROOT
 from src.models.production.forecasting import READ_COLUMNS
 
 

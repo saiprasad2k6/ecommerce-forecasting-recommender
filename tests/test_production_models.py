@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+from src.models.comparison import forecast_gate, ranking_gate
 from src.models.production import common, forecasting, recommendation
 from src.models.production.forecasting import ProductionForecaster
 from src.models.production.recommendation import (
@@ -79,13 +80,13 @@ def warehouse_fixture(path):
 
 class ProductionModelTests(unittest.TestCase):
     def test_gates_reject_rmse_and_holdout_regressions(self):
-        self.assertFalse(common.forecast_gate({"mae": 0.5, "rmse": 2},
+        self.assertFalse(forecast_gate({"mae": 0.5, "rmse": 2},
                                              {"mae": 1, "rmse": 1}))
-        self.assertFalse(common.forecast_gate({"mae": 0.5, "rmse": 0.5},
+        self.assertFalse(forecast_gate({"mae": 0.5, "rmse": 0.5},
                                              {"mae": 1, "rmse": 1}, varying=False))
         baseline = {"precision_at_k": 0.3, "recall_at_k": 0.4}
-        validation = common.ranking_gate({"precision_at_k": 0.4, "recall_at_k": 0.5}, baseline)
-        holdout = common.ranking_gate({"precision_at_k": 0.4, "recall_at_k": 0.2}, baseline)
+        validation = ranking_gate({"precision_at_k": 0.4, "recall_at_k": 0.5}, baseline)
+        holdout = ranking_gate({"precision_at_k": 0.4, "recall_at_k": 0.2}, baseline)
         self.assertTrue(validation)
         self.assertFalse(validation and holdout)
 
@@ -113,7 +114,7 @@ class ProductionModelTests(unittest.TestCase):
                 & (frame.purchase_date + pd.Timedelta(days=1)).lt(test_start)
             ].shape[0]
             self.assertEqual(metrics["lightgbm"]["rows"], expected_rows)
-            self.assertEqual(metrics["same_day_last_week"]["mae"], 0)
+            self.assertEqual(metrics["lightgbm"]["mae"], 0)
 
             # Older feature files get a clear rebuild instruction at preflight.
             test_path = root / "test.parquet"
@@ -125,7 +126,7 @@ class ProductionModelTests(unittest.TestCase):
     def test_rejected_candidate_preserves_existing_model(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pkl"
-            common.atomic_dump({"previous": True}, path)
+            common.publish_model({"previous": True}, path, True)
             self.assertEqual(common.publish_model({"candidate": True}, path, False), "retained_existing_model")
             self.assertEqual(joblib.load(path), {"previous": True})
 
@@ -164,29 +165,20 @@ class ProductionModelTests(unittest.TestCase):
             root = Path(directory)
             frame, _ = forecast_fixture(root / "features")
             with isolated_tracking(root) as tracking:
-                report = forecasting.run_pipeline(root / "features", root / "outputs", root / "model.pkl",
-                                            tracking, max_train_rows=100, n_estimators=5)
+                report = forecasting.run_pipeline(root / "features", root / "outputs", tracking, max_train_rows=100, n_estimators=5)
             self.assertIn("mlflow_run_id", report)
             client = common.mlflow.MlflowClient(tracking_uri=tracking)
             run = client.get_run(report["mlflow_run_id"])
             self.assertEqual(run.info.status, "FINISHED")
             self.assertAlmostEqual(run.data.metrics["val_mae"],
-                                   report["validation"]["lightgbm"]["mae"])
-            self.assertAlmostEqual(run.data.metrics["val_baseline_mae"],
-                                   report["validation"][report["baseline"]]["mae"])
-            self.assertEqual(run.data.tags["holdout_gate_passed"],
-                             str(report["holdout_passed"]).lower())
-            self.assertEqual(set(run.data.metrics), {
-                "val_mae", "val_rmse", "val_baseline_mae", "val_baseline_rmse",
-                "test_mae", "test_rmse", "test_baseline_mae", "test_baseline_rmse",
-            })
-            candidate = joblib.load(Path(report["output_dir"]) / "candidate.pkl")
+                                   report["validation"]["mae"])
+            self.assertEqual(set(run.data.metrics), {"val_mae", "val_rmse", "test_mae", "test_rmse"})
+            candidate = joblib.load(Path(report["output_dir"]) / "model.pkl")
             self.assertIsInstance(candidate, ProductionForecaster)
             predicted = candidate.predict(frame.head(10))
             self.assertTrue(np.isfinite(predicted).all())
             self.assertTrue((predicted >= 0).all())
-            selected = joblib.load(root / "model.pkl")
-            self.assertEqual(selected.use_model, report["approved"])
+            self.assertFalse((root / "model.pkl").exists())
             unknown = frame.head(1).copy()
             unknown["product_id"] = "unknown-product"
             self.assertEqual(candidate.prepare_features(unknown).product_id_code.iloc[0], -1)
@@ -199,8 +191,7 @@ class ProductionModelTests(unittest.TestCase):
                 with patch.object(common.mlflow, "log_artifact",
                                   side_effect=RuntimeError("tracking unavailable")):
                     with self.assertRaisesRegex(RuntimeError, "tracking unavailable"):
-                        forecasting.run_pipeline(root / "features", root / "outputs", root / "model.pkl",
-                                          tracking, max_train_rows=100, n_estimators=5)
+                        forecasting.run_pipeline(root / "features", root / "outputs", tracking, max_train_rows=100, n_estimators=5)
             self.assertFalse((root / "model.pkl").exists())
 
     def test_baseline_pipelines_log_only_basic_metrics(self):
@@ -218,10 +209,10 @@ class ProductionModelTests(unittest.TestCase):
                 )
             client = common.mlflow.MlflowClient(tracking_uri=tracking)
             for result in forecasting["runs"]:
-                metrics = client.get_run(result["run_id"]).data.metrics
+                metrics = client.get_run(result["mlflow_run_id"]).data.metrics
                 self.assertEqual(set(metrics), {"val_mae", "val_rmse", "test_mae", "test_rmse"})
             for result in recommendations["runs"]:
-                metrics = client.get_run(result["run_id"]).data.metrics
+                metrics = client.get_run(result["mlflow_run_id"]).data.metrics
                 self.assertEqual(set(metrics), {
                     "val_precision_at_k", "val_recall_at_k",
                     "test_precision_at_k", "test_recall_at_k",
@@ -232,8 +223,7 @@ class ProductionModelTests(unittest.TestCase):
             root = Path(directory)
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
-                report = recommendation.run_pipeline(root / "olist.duckdb", root / "outputs", root / "model.pkl",
-                    tracking, candidate_limit=5, top_k=3, n_estimators=5)
+                report = recommendation.run_pipeline(root / "olist.duckdb", root / "outputs", tracking, candidate_limit=5, top_k=3, n_estimators=5)
             from src.models.baseline.recommendation_baselines import load_history
             cutoff = pd.Timestamp("2018-08-01")
             snapshot = RecommendationSnapshot(load_history(root / "olist.duckdb", cutoff), cutoff, 5)
@@ -248,7 +238,8 @@ class ProductionModelTests(unittest.TestCase):
             self.assertTrue(cold.category_affinity.eq(0).all())
             self.assertTrue(cold.regional_recent.eq(0).all())
             self.assertTrue(cold.days_since_purchase.eq(-1).all())
-            model = joblib.load(root / "model.pkl")
+            self.assertFalse((root / "model.pkl").exists())
+            model = joblib.load(Path(report["output_dir"]) / "model.pkl")
             products = model.predict(snapshot, "c1", 3)
             self.assertEqual(len(products), len(set(products)))
             self.assertTrue(set(products).issubset(snapshot.catalog))
@@ -264,9 +255,7 @@ class ProductionModelTests(unittest.TestCase):
             run = client.get_run(report["mlflow_run_id"])
             self.assertEqual(set(run.data.metrics), {
                 "val_precision_at_k", "val_recall_at_k",
-                "val_baseline_precision_at_k", "val_baseline_recall_at_k",
                 "test_precision_at_k", "test_recall_at_k",
-                "test_baseline_precision_at_k", "test_baseline_recall_at_k",
             })
 
 

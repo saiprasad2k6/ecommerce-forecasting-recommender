@@ -1,6 +1,8 @@
-"""Model approval, safe publication and MLflow reporting."""
+"""Shared evaluation fingerprints, model publication and MLflow reporting."""
 
+import hashlib
 import json
+from uuid import uuid4
 import os
 from pathlib import Path
 import tempfile
@@ -15,21 +17,6 @@ ROOT = Path(__file__).resolve().parents[3]
 TRACKING_URI = f"sqlite:///{ROOT / 'data/baselines/mlflow.db'}"
 
 
-def sql_path(path: Path) -> str:
-    return str(path).replace("'", "''")
-
-
-def atomic_dump(model, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as stream:
-        temporary = Path(stream.name)
-    try:
-        joblib.dump(model, temporary)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def publish_model(model, path: Path, approved: bool) -> str:
     """Never replace an existing model with a rejected candidate.
 
@@ -38,72 +25,61 @@ def publish_model(model, path: Path, approved: bool) -> str:
     """
     if not approved and path.exists():
         return "retained_existing_model"
-    atomic_dump(model, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        joblib.dump(model, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return "published_trained_model" if approved else "published_baseline_fallback"
 
 
-def forecast_gate(candidate, baseline, varying=True):
-    return bool(
-        candidate["mae"] < baseline["mae"]
-        and candidate["rmse"] <= baseline["rmse"]
-        and varying
-    )
+def evaluation_context(task, paths, **settings):
+    """Identify the evaluation files, protocol and settings, independently of run time."""
+    files = {}
+    for path in paths:
+        with Path(path).open("rb") as stream:
+            files[str(Path(path).resolve())] = hashlib.file_digest(stream, "sha256").hexdigest()
+    protocol = hashlib.sha256((Path(__file__).parents[1] / "evaluation.py").read_bytes()).hexdigest()
+    context = {"task": task, "files": files, "protocol": protocol, **settings}
+    context["evaluation_id"] = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+    return context
 
 
-def ranking_gate(candidate, baseline):
-    return bool(
-        candidate["recall_at_k"] > baseline["recall_at_k"]
-        and candidate["precision_at_k"] >= baseline["precision_at_k"]
-    )
+def forecast_context(features_dir):
+    return evaluation_context("forecasting", [features_dir / name for name in
+        ["metadata.json", "validation.parquet", "test.parquet"]], target="target_demand_next_day")
 
 
-def save_run(model, report, params, output_dir, model_path, tracking_uri, experiment):
-    """Save the candidate and metrics, log to MLflow, then update the active model."""
+def recommendation_context(warehouse, validation_cutoff, test_cutoff, test_end, candidate_limit, k):
+    return evaluation_context("recommendation", [warehouse],
+        validation_cutoff=str(pd.Timestamp(validation_cutoff).date()),
+        test_cutoff=str(pd.Timestamp(test_cutoff).date()), test_end=str(pd.Timestamp(test_end).date()),
+        candidate_limit=candidate_limit, k=k)
+
+
+def save_run(model, report, params, output_dir, tracking_uri, experiment, comparison_id=None):
+    """Log one independently evaluated model. Publication belongs to comparison."""
     (ROOT / "data/baselines").mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment)
-    with mlflow.start_run(run_name="production__" + report["candidate"]) as run:
-        output = output_dir / run.info.run_id
+    with mlflow.start_run(run_name=report["role"] + "__" + report["model"]) as run:
+        output = Path(output_dir) / run.info.run_id
         output.mkdir(parents=True)
-        report.update(
-            approved=report["validation_approved"] and report["holdout_passed"],
-            publication="pending", output_dir=str(output), model_path=str(model_path),
-            mlflow_run_id=run.info.run_id, params=params,
-        )
-        model.fallback = report["baseline"]
-        joblib.dump(model, output / "candidate.pkl")
-        model.use_model = report["approved"]
-        metrics = pd.concat({
-            split: pd.DataFrame.from_dict(report[split], orient="index")
-            for split in ["validation", "test"]
-        }, names=["split", "method"]).reset_index()
-        metrics.to_csv(output / "metrics.csv", index=False)
-        mlflow.log_params({"baseline_name": report["baseline"], **params})
-        status = "validated_candidate" if report["approved"] else "rejected_candidate"
-        mlflow.set_tags({
-            "pipeline_integrated": "true",
-            "selected_on_validation": str(report["validation_approved"]).lower(),
-            "model_status": status,
-        })
+        report.update(comparison_id=comparison_id or uuid4().hex,
+                      mlflow_run_id=run.info.run_id, output_dir=str(output), params=params)
+        joblib.dump(model, output / "model.pkl")
+        pd.DataFrame({split: report[split] for split in ["validation", "test"]}).T.to_csv(output / "metrics.csv")
+        mlflow.log_params(params)
+        mlflow.set_tags({key: report[key] for key in ["task", "role", "model", "comparison_id"]})
+        mlflow.set_tag("evaluation_id", report["evaluation_context"]["evaluation_id"])
         for split, prefix in [("validation", "val"), ("test", "test")]:
-            scores = pd.DataFrame.from_dict(report[split], orient="index").drop(
-                columns=["rows", "customers"], errors="ignore"
-            )
-            values = {
-                prefix: scores.loc[report["candidate"]].to_dict(),
-                prefix + "_baseline": scores.loc[report["baseline"]].to_dict(),
-            }
-            flattened = pd.json_normalize(values, sep="_").iloc[0].dropna().to_dict()
-            mlflow.log_metrics(flattened)
-        mlflow.set_tags({
-            "validation_gate_passed": str(report["validation_approved"]).lower(),
-            "holdout_gate_passed": str(report["holdout_passed"]).lower(),
-        })
-        mlflow.log_artifact(str(output / "candidate.pkl"))
+            mlflow.log_metrics({prefix + "_" + key: value for key, value in report[split].items()
+                                if key not in ["rows", "customers"]})
+        mlflow.log_artifact(str(output / "model.pkl"))
         mlflow.log_artifact(str(output / "metrics.csv"))
-
-        # Publish only after logging succeeds, so failures keep the active model.
-        report["publication"] = publish_model(model, model_path, report["approved"])
         (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False))
         mlflow.log_dict(report, "report.json")
     return report

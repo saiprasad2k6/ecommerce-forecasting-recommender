@@ -29,10 +29,12 @@ scripts/
 │   ├── baseline/
 │   │   ├── forecasting_baselines.py
 │   │   └── recommendation_baselines.py
-│   └── production/
-│       ├── validate_inputs.py
-│       ├── train_forecasting.py
-│       └── train_recommendation.py
+│   ├── production/
+│   │   ├── validate_inputs.py
+│   │   ├── train_forecasting.py
+│   │   └── train_recommendation.py
+│   └── comparison/
+│       └── compare_models.py
 └── maintenance/
     ├── cleanup_data.py
     └── reset_repository.py
@@ -115,24 +117,16 @@ This DAG does not reset existing files or run at import time. Stop Airflow befor
 
 Reusable implementations live in `src/models/production/`; CLI wrappers live in `scripts/models/production/`.
 
-Both production modules expose the same entry points. Start with `run_pipeline()`:
+Both production modules follow the same procedure:
 
 ```text
 prepare_data() → train_model() → evaluate_model() → save_run()
 ```
 
-Data preparation and evaluation differ by model, but the procedure and names match.
-Both files define the same public functions: `predict_baseline()`, `prepare_data()`,
-`train_model()`, `evaluate_model()`, `run_pipeline()` and `main()`. The shared
-`save_run()` implementation is imported from `common.py`. Model-specific loading
-helpers use private names: `_feature_query()` and `_load_labels()`.
-Both model wrappers expose `predict()`, and feature preparation uses `prepare_features()`.
-`common.save_run()` saves the model and metrics, records them in
-MLflow, and updates the active model when the checks pass. Standard operations use
-the existing libraries: scikit-learn calculates MAE/MSE, pandas handles category
-codes, feature alignment, deduplication and batch aggregation, and MLflow supplies
-run IDs and JSON report logging. Custom code handles date boundaries, candidate
-rules, fallback selection and model approval.
+Baseline evaluation runs independently under `src/models/baseline/`. Both jobs use
+`src/models/evaluation.py` for evaluation rows and metrics. Each job logs its own
+model and scores; training does not execute baselines or publish active models.
+`src/models/comparison.py` reads the completed MLflow runs and makes the release decision.
 
 Both models default to **100 trees** (`--n-estimators`) and **seed 42** (`--seed`).
 The estimator constructors specify the task objective, evaluation metric, tree count,
@@ -148,13 +142,45 @@ configured tree count. The same defaults are used by the Airflow DAG.
 
 First complete `olist_end_to_end_pipeline`. Disconnect DBeaver from `olist.duckdb` before training, and avoid running warehouse preparation at the same time. Run from the repository root:
 
-```bash
-.venv/bin/python scripts/models/production/validate_inputs.py
-.venv/bin/python scripts/models/production/train_forecasting.py
-.venv/bin/python scripts/models/production/train_recommendation.py
+The **`olist_production_training`** DAG runs six separate tasks:
+
+```text
+validate_training_inputs
+  → evaluate_forecasting_baselines
+  → evaluate_recommendation_baselines
+  → train_forecasting_model
+  → train_recommendation_model
+  → compare_models
 ```
 
-The separate Airflow DAG **`olist_production_training`** runs these three commands in order. It appears alongside `olist_end_to_end_pipeline` when Airflow loads `pipelines/`. Unpause and trigger it manually after the data pipeline succeeds. It does not download or rebuild data. The trigger form exposes `max_train_rows`, `forecast_estimators`, `ranking_estimators`, `candidate_limit` and `top_k` (which must not exceed `candidate_limit`). CLI `--help` also exposes historical recommendation cutoff dates and custom artifact/database paths.
+Trigger it from the Airflow UI after `olist_end_to_end_pipeline` succeeds, or use:
+
+```bash
+airflow dags trigger olist_production_training
+```
+
+The DAG appears when Airflow loads `pipelines/`. It uses its Airflow run ID as the
+`comparison_id` for all jobs. Tasks run one at a time for the local SQLite/DuckDB
+setup. The trigger form exposes training row limits, tree counts, candidate limits
+and Top K. Input data is reused; this DAG does not download or rebuild it.
+
+To run the same workflow manually, use a **new comparison ID for each workflow**
+and pass the same ID to every job:
+
+```bash
+COMPARISON_ID="manual-$(date +%Y%m%d-%H%M%S)"
+.venv/bin/python scripts/models/production/validate_inputs.py
+.venv/bin/python scripts/models/baseline/forecasting_baselines.py --comparison-id "$COMPARISON_ID"
+.venv/bin/python scripts/models/baseline/recommendation_baselines.py --comparison-id "$COMPARISON_ID"
+.venv/bin/python scripts/models/production/train_forecasting.py --comparison-id "$COMPARISON_ID"
+.venv/bin/python scripts/models/production/train_recommendation.py --comparison-id "$COMPARISON_ID"
+.venv/bin/python scripts/models/comparison/compare_models.py --comparison-id "$COMPARISON_ID"
+```
+
+Standalone jobs can also run without an ID for exploration; each generates a new
+ID and therefore will not automatically form a comparison group. When changing
+recommendation dates, `--top-k` or `--candidate-limit`, pass identical evaluation
+settings to both recommendation jobs.
 
 ### Forecasting evaluation
 
@@ -172,19 +198,29 @@ The separate Airflow DAG **`olist_production_training`** runs these three comman
 - A snapshot uses only purchases made and delivered before its cutoff. Training delivery outcomes must be known before validation; validation outcomes before test; test outcomes before the test-period end.
 - Candidates come from global popularity, recent customer categories and purchase history. Future purchased products are never injected into candidate lists. Repeat purchases are eligible for both ranker and baselines.
 - Training omits groups without positive/negative candidate variation because they supply no pairwise ranking signal. Evaluation retains all purchasing customers, including new customers and purchases outside the candidate/catalog pool.
-- Recommendation baselines and production models report only **Precision@K** (the fraction of recommendations purchased) and **Recall@K** (the fraction of purchases included in the recommendations). Higher is better. Both model and baselines use the same customers. Warm/new breakdowns remain available in baseline CSV artifacts, using the same two metrics.
+- Recommendation baselines and production models report only **Precision@K** (the fraction of recommendations purchased) and **Recall@K** (the fraction of purchases included in the recommendations). Higher is better. Both model and baselines use the same customers and delivery-outcome boundaries.
 - The ranker trains for the configured `ranking_estimators` rounds. Validation selects the baseline by Recall@K, with Precision@K as a tiebreaker; test checks the frozen model. Forecasting still uses early stopping, monitoring MAE.
 - Inventory, recalls, views, brands and promotions are not supplied by Olist and are not fabricated.
 
 ### Model files and release checks
 
-Each run saves three files in a unique directory under `data/production/forecasting/` or `data/production/recommendations/`:
+Each baseline/candidate run saves three files in its own MLflow run directory:
 
-- `candidate.pkl`: the trained model bundle, including its preprocessing and fallback rule.
-- `metrics.csv`: validation and test metrics for the model and all baselines.
-- `report.json`: run parameters, evaluation results, approval and publication decisions.
+- `model.pkl`: that run's model, with its preprocessing or baseline rule.
+- `metrics.csv`: that model's validation and test metrics.
+- `report.json`: evaluation settings, data fingerprint, run ID and parameters.
 
-Both programs log the bundle, metrics and report to the existing separate MLflow experiments. The simplified trainers no longer export a second model format, a separate `selected.pkl`, feature schemas/importances, sample predictions or cohort CSVs. Existing run directories are preserved.
+Baseline artifacts are under `data/baselines/forecasting/` and
+`data/baselines/recommendations/`; candidates are under `data/production/forecasting/`
+and `data/production/recommendations/`. Historical runs remain unchanged.
+
+Only the final comparison task updates active model files. It requires all baseline
+runs and the candidate from the same comparison ID, with matching evaluation
+fingerprints, settings and row/customer counts. Missing or incompatible runs fail
+the task before either model is published. Task retries use the newest completed
+run for each method within that group; failed runs and other groups are excluded.
+Comparison decisions are logged as separate MLflow runs and saved under
+`data/comparisons/<comparison-run-id>/report.json`.
 
 The strongest nonzero forecasting baseline and strongest recommendation baseline are selected using validation only. A trained model must improve validation MAE without worse RMSE (forecasting), or improve Recall@K without worse Precision@K (recommendations). Constant forecasting predictions are rejected. The same frozen candidate must also pass those metric comparisons against that baseline on test before publication. Test is a release veto, not a source for selecting hyperparameters or baseline methods.
 
@@ -195,7 +231,7 @@ New runs log only these two performance metrics per task for validation and test
 | `models/forecast_model.pkl` | `joblib.load(path).predict(feature_frame)` |
 | `models/recommender.pkl` | `joblib.load(path).predict(snapshot, customer_id, k)` |
 
-A rejected candidate never replaces an existing active file. On the first run, a baseline fallback bundle is written if the candidate fails. Inspect `approved`, `validation_approved`, `holdout_passed` and `publication` in the run report; successful training/DAG execution does not mean the learned model was approved. Load `.pkl` bundles only from trusted runs in this repository. They include the estimator and preprocessing/fallback configuration and can be loaded with `joblib.load()`.
+A rejected candidate never replaces an existing active file. On the first run, a baseline fallback bundle is written if the candidate fails. Inspect `approved`, `validation_approved`, `holdout_passed` and `publication` in the comparison report; successful training/DAG execution does not mean the learned model was approved. Load `.pkl` bundles only from trusted runs in this repository. They include the estimator and preprocessing/fallback configuration and can be loaded with `joblib.load()`.
 
 To use the saved recommendation bundle:
 
@@ -227,10 +263,10 @@ After running the baseline programs or the Airflow pipeline, open a new terminal
 
 Open [http://localhost:5001](http://localhost:5001) and select an experiment:
 
-- **`ecommerce-demand-forecasting`**: forecasting baseline runs.
-- **`ecommerce-recommendations`**: recommendation baseline runs.
+- **`ecommerce-demand-forecasting`**: forecasting baseline, candidate and comparison runs.
+- **`ecommerce-recommendations`**: recommendation baseline, candidate and comparison runs.
 
-Click a run to inspect its parameters, validation/test metrics, tags and saved CSV artifacts. Select multiple runs and click **Compare** to compare their performance.
+Click a run to inspect its parameters, validation/test metrics, tags and saved CSV artifacts. Filter by the `comparison_id` tag, select baseline/candidate runs and click **Compare**. The `role` tag identifies `baseline`, `candidate` and `comparison` runs. Baseline and candidate runs use the same metric names (`val_mae`, `test_mae`, or `val_recall_at_k`, for example).
 
 Keep the terminal running while using the UI; press **Ctrl+C** to stop the MLflow server. Airflow remains available separately at [http://localhost:8080](http://localhost:8080). If port 5001 is already occupied, choose another port and use that port in the browser URL.
 
