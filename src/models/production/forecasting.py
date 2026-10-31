@@ -121,7 +121,7 @@ def evaluate_model(model, features_dir, split, label_before=None):
 
 
 def run_pipeline(features_dir=ROOT / "data/features/forecasting", output_dir=ROOT / "data/production/forecasting",
-                 tracking_uri=TRACKING_URI, max_train_rows=1_000_000, n_estimators=100, seed=42, comparison_id=None):
+                 tracking_uri=TRACKING_URI, max_train_rows=1_000_000, n_estimators=100, seed=42, pipeline_run_id=None):
     context = forecast_context(features_dir)
     train, validation, weights, metadata, population = prepare_data(features_dir, max_train_rows, seed)
     model = train_model(train, validation, weights, n_estimators, seed)
@@ -136,14 +136,14 @@ def run_pipeline(features_dir=ROOT / "data/features/forecasting", output_dir=ROO
     params = {"target": "target_demand_next_day", "training_rows": len(train),
               "training_population_rows": population, "max_train_rows": max_train_rows,
               "seed": seed, "n_estimators": n_estimators, "trained_estimators": model.estimator.n_estimators_}
-    return save_run(model, report, params, output_dir, tracking_uri, "ecommerce-demand-forecasting", comparison_id)
+    return save_run(model, report, params, output_dir, tracking_uri, "ecommerce-demand-forecasting", pipeline_run_id)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features-dir", type=Path, default=ROOT / "data/features/forecasting")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/forecasting")
-    parser.add_argument("--comparison-id")
+    parser.add_argument("--pipeline-run-id")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
     parser.add_argument("--max-train-rows", type=int, default=1_000_000)
     parser.add_argument("--n-estimators", type=int, default=100)

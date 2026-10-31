@@ -25,7 +25,7 @@ def training_task(task_id, script, arguments, env):
         bash_command=f'export PATH={python_bin}:"$PATH"\nexec {command} {arguments}',
         cwd=str(ROOT),
         env={"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
-             "COMPARISON_ID": "{{ run_id }}", **env},
+             "PIPELINE_RUN_ID": "{{ run_id }}", **env},
         append_env=True,
         do_xcom_push=False,
         skip_on_exit_code=None,
@@ -79,17 +79,17 @@ with DAG(
     )
     forecast_baselines = training_task(
         "evaluate_forecasting_baselines", "baseline/forecasting_baselines.py",
-        '--comparison-id "$COMPARISON_ID"', env={},
+        '--pipeline-run-id "$PIPELINE_RUN_ID"', env={},
     )
     recommendation_baselines = training_task(
         "evaluate_recommendation_baselines", "baseline/recommendation_baselines.py",
-        '--comparison-id "$COMPARISON_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K"',
+        '--pipeline-run-id "$PIPELINE_RUN_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K"',
         env={"CANDIDATES": "{{ params.candidate_limit }}", "TOP_K": "{{ params.top_k }}"},
     )
     forecasting = training_task(
         "train_forecasting_model",
         "production/train_forecasting.py",
-        '--comparison-id "$COMPARISON_ID" --max-train-rows "$TRAIN_ROWS" --n-estimators "$ESTIMATORS"',
+        '--pipeline-run-id "$PIPELINE_RUN_ID" --max-train-rows "$TRAIN_ROWS" --n-estimators "$ESTIMATORS"',
         env={
             "TRAIN_ROWS": "{{ params.max_train_rows }}",
             "ESTIMATORS": "{{ params.forecast_estimators }}",
@@ -98,7 +98,7 @@ with DAG(
     recommendation = training_task(
         "train_recommendation_model",
         "production/train_recommendation.py",
-        '--comparison-id "$COMPARISON_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K" --n-estimators "$ESTIMATORS"',
+        '--pipeline-run-id "$PIPELINE_RUN_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K" --n-estimators "$ESTIMATORS"',
         env={
             "CANDIDATES": "{{ params.candidate_limit }}",
             "TOP_K": "{{ params.top_k }}",
@@ -107,6 +107,6 @@ with DAG(
     )
     comparison = training_task(
         "compare_models", "comparison/compare_models.py",
-        '--comparison-id "$COMPARISON_ID"', env={},
+        '--pipeline-run-id "$PIPELINE_RUN_ID"', env={},
     )
     validate_inputs >> forecast_baselines >> recommendation_baselines >> forecasting >> recommendation >> comparison

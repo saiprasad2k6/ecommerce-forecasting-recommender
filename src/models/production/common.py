@@ -60,7 +60,7 @@ def recommendation_context(warehouse, validation_cutoff, test_cutoff, test_end, 
         candidate_limit=candidate_limit, k=k)
 
 
-def save_run(model, report, params, output_dir, tracking_uri, experiment, comparison_id=None):
+def save_run(model, report, params, output_dir, tracking_uri, experiment, pipeline_run_id=None):
     """Log one independently evaluated model. Publication belongs to comparison."""
     (ROOT / "data/baselines").mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(tracking_uri)
@@ -68,12 +68,12 @@ def save_run(model, report, params, output_dir, tracking_uri, experiment, compar
     with mlflow.start_run(run_name=report["role"] + "__" + report["model"]) as run:
         output = Path(output_dir) / run.info.run_id
         output.mkdir(parents=True)
-        report.update(comparison_id=comparison_id or uuid4().hex,
+        report.update(pipeline_run_id=pipeline_run_id or uuid4().hex,
                       mlflow_run_id=run.info.run_id, output_dir=str(output), params=params)
         joblib.dump(model, output / "model.pkl")
         pd.DataFrame({split: report[split] for split in ["validation", "test"]}).T.to_csv(output / "metrics.csv")
         mlflow.log_params(params)
-        mlflow.set_tags({key: report[key] for key in ["task", "role", "model", "comparison_id"]})
+        mlflow.set_tags({key: report[key] for key in ["task", "role", "model", "pipeline_run_id"]})
         mlflow.set_tag("evaluation_id", report["evaluation_context"]["evaluation_id"])
         for split, prefix in [("validation", "val"), ("test", "test")]:
             mlflow.log_metrics({prefix + "_" + key: value for key, value in report[split].items()

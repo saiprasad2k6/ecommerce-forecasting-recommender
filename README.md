@@ -127,6 +127,9 @@ Baseline evaluation runs independently under `src/models/baseline/`. Both jobs u
 `src/models/evaluation.py` for evaluation rows and metrics. Each job logs its own
 model and scores; training does not execute baselines or publish active models.
 `src/models/comparison.py` reads the completed MLflow runs and makes the release decision.
+Its `compare_models()` function coordinates three steps: `load_model_results()` loads
+the completed runs, `compare_model_results()` selects and checks the candidate, and
+`save_comparison()` records the decision and publishes the selected model.
 
 Both models default to **100 trees** (`--n-estimators`) and **seed 42** (`--seed`).
 The estimator constructors specify the task objective, evaluation metric, tree count,
@@ -160,21 +163,21 @@ airflow dags trigger olist_production_training
 ```
 
 The DAG appears when Airflow loads `pipelines/`. It uses its Airflow run ID as the
-`comparison_id` for all jobs. Tasks run one at a time for the local SQLite/DuckDB
+`pipeline_run_id` for all jobs. Tasks run one at a time for the local SQLite/DuckDB
 setup. The trigger form exposes training row limits, tree counts, candidate limits
 and Top K. Input data is reused; this DAG does not download or rebuild it.
 
-To run the same workflow manually, use a **new comparison ID for each workflow**
+To run the same workflow manually, use a **new pipeline run ID for each workflow**
 and pass the same ID to every job:
 
 ```bash
-COMPARISON_ID="manual-$(date +%Y%m%d-%H%M%S)"
+PIPELINE_RUN_ID="manual-$(date +%Y%m%d-%H%M%S)"
 .venv/bin/python scripts/models/production/validate_inputs.py
-.venv/bin/python scripts/models/baseline/forecasting_baselines.py --comparison-id "$COMPARISON_ID"
-.venv/bin/python scripts/models/baseline/recommendation_baselines.py --comparison-id "$COMPARISON_ID"
-.venv/bin/python scripts/models/production/train_forecasting.py --comparison-id "$COMPARISON_ID"
-.venv/bin/python scripts/models/production/train_recommendation.py --comparison-id "$COMPARISON_ID"
-.venv/bin/python scripts/models/comparison/compare_models.py --comparison-id "$COMPARISON_ID"
+.venv/bin/python scripts/models/baseline/forecasting_baselines.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/baseline/recommendation_baselines.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/production/train_forecasting.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/production/train_recommendation.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/comparison/compare_models.py --pipeline-run-id "$PIPELINE_RUN_ID"
 ```
 
 Standalone jobs can also run without an ID for exploration; each generates a new
@@ -215,7 +218,7 @@ Baseline artifacts are under `data/baselines/forecasting/` and
 and `data/production/recommendations/`. Historical runs remain unchanged.
 
 Only the final comparison task updates active model files. It requires all baseline
-runs and the candidate from the same comparison ID, with matching evaluation
+runs and the candidate from the same pipeline run ID, with matching evaluation
 fingerprints, settings and row/customer counts. Missing or incompatible runs fail
 the task before either model is published. Task retries use the newest completed
 run for each method within that group; failed runs and other groups are excluded.
@@ -266,7 +269,7 @@ Open [http://localhost:5001](http://localhost:5001) and select an experiment:
 - **`ecommerce-demand-forecasting`**: forecasting baseline, candidate and comparison runs.
 - **`ecommerce-recommendations`**: recommendation baseline, candidate and comparison runs.
 
-Click a run to inspect its parameters, validation/test metrics, tags and saved CSV artifacts. Filter by the `comparison_id` tag, select baseline/candidate runs and click **Compare**. The `role` tag identifies `baseline`, `candidate` and `comparison` runs. Baseline and candidate runs use the same metric names (`val_mae`, `test_mae`, or `val_recall_at_k`, for example).
+Click a run to inspect its parameters, validation/test metrics, tags and saved CSV artifacts. Filter by the `pipeline_run_id` tag, select baseline/candidate runs and click **Compare**. The `role` tag identifies `baseline`, `candidate` and `comparison` runs. Baseline and candidate runs use the same metric names (`val_mae`, `test_mae`, or `val_recall_at_k`, for example).
 
 Keep the terminal running while using the UI; press **Ctrl+C** to stop the MLflow server. Airflow remains available separately at [http://localhost:8080](http://localhost:8080). If port 5001 is already occupied, choose another port and use that port in the browser URL.
 

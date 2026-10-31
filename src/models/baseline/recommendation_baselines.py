@@ -47,13 +47,13 @@ class BaselineRecommender:
 def run_recommendation_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duckdb",
         output_dir=ROOT / "data/baselines/recommendations", tracking_uri=TRACKING_URI,
         experiment_name="ecommerce-recommendations", k=10, candidate_limit=100,
-        validation_cutoff="2018-07-01", test_cutoff="2018-08-01", test_end="2018-09-01", comparison_id=None):
+        validation_cutoff="2018-07-01", test_cutoff="2018-08-01", test_end="2018-09-01", pipeline_run_id=None):
     if not 1 <= k <= candidate_limit:
         raise ValueError("Require 1 <= top-k <= candidate-limit")
     validation_start, test_start, end = map(pd.Timestamp, [validation_cutoff, test_cutoff, test_end])
     if not validation_start < test_start < end:
         raise ValueError("Evaluation dates must be chronological")
-    comparison_id = comparison_id or uuid4().hex
+    pipeline_run_id = pipeline_run_id or uuid4().hex
     context = recommendation_context(warehouse_path, validation_start, test_start, end, candidate_limit, k)
     models = {name: BaselineRecommender(name) for name in METHODS}
     scores = {}
@@ -65,10 +65,10 @@ def run_recommendation_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duck
         raise ValueError("Evaluation data changed during baseline evaluation")
     runs = [save_run(model, {"task": "recommendation", "role": "baseline", "model": name,
                  "validation": scores["validation"][name], "test": scores["test"][name], "evaluation_context": context},
-                 {"k": k, "candidate_limit": candidate_limit}, output_dir, tracking_uri, experiment_name, comparison_id)
+                 {"k": k, "candidate_limit": candidate_limit}, output_dir, tracking_uri, experiment_name, pipeline_run_id)
             for name, model in models.items()]
     champion = min(METHODS, key=lambda name: (-scores["validation"][name]["recall_at_k"], -scores["validation"][name]["precision_at_k"], name))
-    return {"comparison_id": comparison_id, "champion_baseline": champion, "runs": runs}
+    return {"pipeline_run_id": pipeline_run_id, "champion_baseline": champion, "runs": runs}
 
 
 run_pipeline = run_recommendation_pipeline
@@ -85,6 +85,6 @@ def main():
     parser.add_argument("--validation-cutoff", default="2018-07-01")
     parser.add_argument("--test-cutoff", default="2018-08-01")
     parser.add_argument("--test-end", default="2018-09-01")
-    parser.add_argument("--comparison-id")
+    parser.add_argument("--pipeline-run-id")
     print(json.dumps(run_pipeline(**vars(parser.parse_args())), indent=2))
     return 0

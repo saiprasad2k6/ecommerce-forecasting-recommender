@@ -53,8 +53,8 @@ def evaluate_baselines_duckdb(parquet_path, split_name):
 
 def run_baseline_pipeline(features_dir=ROOT / "data/features/forecasting",
                           output_dir=ROOT / "data/baselines/forecasting", tracking_uri=TRACKING_URI,
-                          experiment_name="ecommerce-demand-forecasting", comparison_id=None):
-    comparison_id = comparison_id or uuid4().hex
+                          experiment_name="ecommerce-demand-forecasting", pipeline_run_id=None):
+    pipeline_run_id = pipeline_run_id or uuid4().hex
     context = forecast_context(features_dir)
     metadata = json.loads((features_dir / "metadata.json").read_text())
     boundary = pd.Timestamp(metadata["date_ranges"]["test"]["min"])
@@ -65,10 +65,10 @@ def run_baseline_pipeline(features_dir=ROOT / "data/features/forecasting",
         raise ValueError("Evaluation data changed during baseline evaluation")
     runs = [save_run(model, {"task": "forecasting", "role": "baseline", "model": name,
                  "validation": validation[name], "test": test[name], "evaluation_context": context},
-                 {"target": "target_demand_next_day"}, output_dir, tracking_uri, experiment_name, comparison_id)
+                 {"target": "target_demand_next_day"}, output_dir, tracking_uri, experiment_name, pipeline_run_id)
             for name, model in models.items()]
     champion = min((name for name in METHODS if name != "always_zero"), key=lambda name: (validation[name]["mae"], name))
-    return {"comparison_id": comparison_id, "champion_baseline": champion, "runs": runs}
+    return {"pipeline_run_id": pipeline_run_id, "champion_baseline": champion, "runs": runs}
 
 
 run_pipeline = run_baseline_pipeline
@@ -80,6 +80,6 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/baselines/forecasting")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
     parser.add_argument("--experiment-name", default="ecommerce-demand-forecasting")
-    parser.add_argument("--comparison-id")
+    parser.add_argument("--pipeline-run-id")
     print(json.dumps(run_pipeline(**vars(parser.parse_args())), indent=2))
     return 0

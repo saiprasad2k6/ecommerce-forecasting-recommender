@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory() as directory:
         args = json.loads(record_file.read_text())
         assert Path(args[0]).is_file()
         if task.task_id != 'validate_training_inputs':
-            assert args[args.index('--comparison-id') + 1] == 'manual__example'
+            assert args[args.index('--pipeline-run-id') + 1] == 'manual__example'
         if task.task_id == 'train_forecasting_model':
             assert args[args.index('--max-train-rows') + 1] == '1000'
     print('Both DAGs, dependencies, parameter validation and shell commands verified')

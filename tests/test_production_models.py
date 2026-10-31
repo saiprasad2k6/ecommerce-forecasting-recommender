@@ -154,6 +154,15 @@ class ProductionModelTests(unittest.TestCase):
                                    mean_squared_error(actual, predicted) ** 0.5)
             self.assertEqual(set(metrics["lightgbm"]), {"rows", "mae", "rmse"})
 
+            from src.models.evaluation import evaluate_forecasting
+            zero_model = ProductionForecaster(use_model=False, fallback="always_zero")
+            together, varying = evaluate_forecasting({"last_day": model, "zero": zero_model}, root, "test")
+            self.assertEqual(together["last_day"], metrics["lightgbm"])
+            self.assertAlmostEqual(together["zero"]["mae"], actual.mean())
+            self.assertAlmostEqual(together["zero"]["rmse"], np.sqrt(np.square(actual).mean()))
+            self.assertTrue(varying["last_day"])
+            self.assertFalse(varying["zero"])
+
             frame["target_demand_next_day"] = 0
             frame.to_parquet(root / "test.parquet", index=False)
             zero_metrics, _ = forecasting.evaluate_model(model, root, "test")

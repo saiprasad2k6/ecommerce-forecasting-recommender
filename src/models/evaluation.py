@@ -5,7 +5,6 @@ from pathlib import Path
 import duckdb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 NUMERIC_FEATURES = [
     "demand", "demand_lag_1", "demand_lag_7", "demand_lag_14", "demand_lag_28",
@@ -19,10 +18,7 @@ RANK_FEATURES = [
     "global_recent", "global_all_time", "regional_recent", "category_affinity",
     "category_popularity", "customer_frequency", "days_since_purchase", "product_age_days",
 ]
-REC_PERIODS = {
-    "validation": (pd.Timestamp("2018-07-01"), pd.Timestamp("2018-08-01")),
-    "test": (pd.Timestamp("2018-08-01"), pd.Timestamp("2018-09-01")),
-}
+
 
 def sql_path(path):
     return str(path).replace("'", "''")
@@ -88,9 +84,9 @@ class RecommendationSnapshot:
         counts = recent.groupby("product_id").size()
         all_counts = history.groupby("product_id").size()
         popularity = counts if not counts.empty else all_counts
-        popularity = popularity.rename("count").reset_index()
-        popularity = popularity.sort_values(["count", "product_id"], ascending=[False, True])
-        self.global_order = popularity.product_id.tolist()
+        # Sort IDs first so equal counts have a predictable product order.
+        popularity = popularity.sort_index().sort_values(ascending=False, kind="stable")
+        self.global_order = popularity.index.tolist()
         self.catalog = set(all_counts.index)
         products = history.drop_duplicates("product_id").set_index("product_id")
         self.categories = products.category
@@ -125,13 +121,11 @@ class RecommendationSnapshot:
 
     def prepare_features(self, customer):
         limit = self.candidate_limit
-        popular = self.global_order[:limit]
         categories = self.customer_categories.get(customer, set())
-        matches = self.popular_categories.loc[self.popular_categories.isin(categories)]
-        category_matches = matches.index[:limit].tolist()
-        previously_purchased = self.customer_products.get(customer, [])[:limit]
-        ids = pd.Index(popular + category_matches + previously_purchased, name="product_id")
-        ids = ids.drop_duplicates()
+        category_products = self.popular_categories.loc[self.popular_categories.isin(categories)]
+        candidates = (self.global_order[:limit] + category_products.index[:limit].tolist()
+                      + self.customer_products.get(customer, [])[:limit])
+        ids = pd.Index(candidates, name="product_id").drop_duplicates()
         state = self.states.get(customer, "unknown")
         empty = pd.Series(dtype=float)
         frame = pd.DataFrame(index=ids)
@@ -145,10 +139,8 @@ class RecommendationSnapshot:
         frame["category_popularity"] = product_categories.map(self.category_counts).fillna(0)
         frame["customer_frequency"] = self.frequency.get(customer, empty).reindex(ids, fill_value=0)
         last_purchase = pd.to_datetime(self.last.get(customer, empty).reindex(ids))
-        frame["days_since_purchase"] = (
-            (self.cutoff - last_purchase).dt.total_seconds() / 86400
-        ).fillna(-1)
-        frame["product_age_days"] = (self.cutoff - self.first.reindex(ids)).dt.total_seconds() / 86400
+        frame["days_since_purchase"] = ((self.cutoff - last_purchase) / pd.Timedelta(days=1)).fillna(-1)
+        frame["product_age_days"] = (self.cutoff - self.first.reindex(ids)) / pd.Timedelta(days=1)
         counts = ["global_recent", "global_all_time", "regional_recent",
                   "category_popularity", "customer_frequency"]
         frame[counts] = np.log1p(frame[counts])
@@ -166,43 +158,41 @@ def ranking_metrics(recommendations: list[str], relevant: set[str], k: int) -> d
 
 
 def evaluate_forecasting(models, features_dir, split, label_before=None):
-    """Score only the supplied models on the identical next-day rows."""
-    batches, ranges = [], {name: [float("inf"), float("-inf")] for name in models}
+    """Accumulate batch errors; keep full-split evaluation within bounded memory."""
+    totals = pd.DataFrame(0.0, index=list(models), columns=["absolute", "squared"])
+    minimum = pd.Series(np.inf, index=totals.index)
+    maximum = pd.Series(-np.inf, index=totals.index)
+    rows = 0
     with duckdb.connect() as db:
-        for batch in db.execute(feature_query(features_dir, split, label_before)).fetch_record_batch(100_000):
+        batches = db.execute(feature_query(features_dir, split, label_before)).fetch_record_batch(100_000)
+        for batch in batches:
             frame = batch.to_pandas()
             actual = frame.target_demand_next_day.to_numpy(float)
-            for name, model in models.items():
-                predicted = np.asarray(model.predict(frame), dtype=float)
-                ranges[name][0] = min(ranges[name][0], predicted.min())
-                ranges[name][1] = max(ranges[name][1], predicted.max())
-                batches.append({
-                    "method": name, "rows": len(actual),
-                    "absolute": mean_absolute_error(actual, predicted) * len(actual),
-                    "squared": mean_squared_error(actual, predicted) * len(actual),
-                })
-    if not batches:
+            predicted = pd.DataFrame({name: model.predict(frame) for name, model in models.items()})
+            errors = predicted.sub(actual, axis="index")
+            if not np.isfinite(errors.to_numpy()).all():
+                raise ValueError("Forecast targets and predictions must be finite")
+            # Add errors before averaging, so a short final batch has the right weight.
+            totals["absolute"] += errors.abs().sum()
+            totals["squared"] += errors.pow(2).sum()
+            minimum = np.minimum(minimum, predicted.min())
+            maximum = np.maximum(maximum, predicted.max())
+            rows += len(frame)
+    if rows == 0:
         raise ValueError("Cannot evaluate an empty split")
-    totals = pd.DataFrame(batches).groupby("method").sum()
-    metrics = pd.DataFrame({
-        "rows": totals.rows, "mae": totals.absolute / totals.rows,
-        "rmse": np.sqrt(totals.squared / totals.rows),
-    }).to_dict(orient="index")
-    varying = {name: bool(high - low > 1e-9) for name, (low, high) in ranges.items()}
-    return metrics, varying
+    metrics = pd.DataFrame({"rows": rows, "mae": totals.absolute / rows,
+                            "rmse": np.sqrt(totals.squared / rows)})
+    return metrics.to_dict(orient="index"), (maximum - minimum > 1e-9).to_dict()
 
 
 def evaluate_recommendations(models, snapshot, labels, k):
-    """Score only the supplied models, including misses outside their candidates."""
-    truths = labels.groupby("customer_unique_id").product_id.agg(set).to_dict()
-    if not truths:
+    """Average each model's Precision@K and Recall@K over the same customers."""
+    truths = labels.groupby("customer_unique_id").product_id.agg(set)
+    if truths.empty:
         raise ValueError("No delivered purchase labels in evaluation period")
-    records = []
-    for customer, relevant in truths.items():
-        for name, model in models.items():
-            products = model.predict(snapshot, customer, k)
-            records.append({"method": name, **ranking_metrics(products, relevant, k)})
-    metrics = pd.DataFrame(records).groupby("method").mean().to_dict(orient="index")
-    for row in metrics.values():
-        row["customers"] = len(truths)
+    metrics = {}
+    for name, model in models.items():
+        scores = [ranking_metrics(model.predict(snapshot, customer, k), relevant, k)
+                  for customer, relevant in truths.items()]
+        metrics[name] = {**pd.DataFrame(scores).mean().to_dict(), "customers": len(truths)}
     return metrics

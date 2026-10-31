@@ -74,7 +74,7 @@ def evaluate_model(model, snapshot, labels, k):
 def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT / "data/production/recommendations",
         tracking_uri=TRACKING_URI, training_start="2018-03-01", validation_cutoff="2018-07-01",
         test_cutoff="2018-08-01", test_end="2018-09-01", candidate_limit=100, top_k=10,
-        n_estimators=100, seed=42, comparison_id=None):
+        n_estimators=100, seed=42, pipeline_run_id=None):
     start, validation_start, test_start, end = map(pd.Timestamp, [training_start, validation_cutoff, test_cutoff, test_end])
     if any(date.tzinfo is not None or pd.isna(date) for date in [start, validation_start, test_start, end]):
         raise ValueError("Use timezone-naive dates matching warehouse timestamps")
@@ -97,14 +97,14 @@ def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT
     params = {"training_start": str(start.date()), "training_rows": len(train), "training_groups": len(groups),
               "seed": seed, "n_estimators": n_estimators, "trained_estimators": model.estimator.n_estimators_,
               "k": top_k, "candidate_limit": candidate_limit}
-    return save_run(model, report, params, output_dir, tracking_uri, "ecommerce-recommendations", comparison_id)
+    return save_run(model, report, params, output_dir, tracking_uri, "ecommerce-recommendations", pipeline_run_id)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--warehouse", type=Path, default=ROOT / "data/warehouse/olist.duckdb")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/recommendations")
-    parser.add_argument("--comparison-id")
+    parser.add_argument("--pipeline-run-id")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
     parser.add_argument("--training-start", default="2018-03-01")
     parser.add_argument("--validation-cutoff", default="2018-07-01")

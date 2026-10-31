@@ -18,8 +18,9 @@ from src.models.baseline.recommendation_baselines import run_recommendation_pipe
 
 class ComparisonTests(unittest.TestCase):
     def log_group(self, root, tracking, group="group", approved=True, mismatch=False, holdout_passed=True):
-        for task, (experiment, candidate, baselines, _) in TASKS.items():
-            for name in [*baselines, candidate]:
+        for task, config in TASKS.items():
+            candidate = config["candidate"]
+            for name in [*config["baselines"], candidate]:
                 is_candidate = name == candidate
                 if task == "forecasting":
                     scores = {"mae": 1.0 if is_candidate and approved else 2.0,
@@ -35,7 +36,7 @@ class ComparisonTests(unittest.TestCase):
                 if is_candidate and not holdout_passed:
                     report["test"] = ({"mae": 3.0, "rmse": 3.0, "rows": 10} if task == "forecasting"
                                       else {"precision_at_k": 0.1, "recall_at_k": 0.1, "customers": 10})
-                save_run(model, report, {}, root / "runs", tracking, experiment, group)
+                save_run(model, report, {}, root / "runs", tracking, config["experiment"], group)
 
     def test_approval_then_rejection_retains_active_models(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -90,15 +91,17 @@ class ComparisonTests(unittest.TestCase):
             forecast_fixture(root / "features")
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
-                run_baseline_pipeline(root / "features", root / "forecast_baselines", tracking, comparison_id="sample")
+                run_baseline_pipeline(root / "features", root / "forecast_baselines", tracking, pipeline_run_id="sample")
                 run_recommendation_pipeline(root / "olist.duckdb", root / "rec_baselines", tracking,
-                                           k=3, candidate_limit=5, comparison_id="sample")
+                                           k=3, candidate_limit=5, pipeline_run_id="sample")
                 forecast = forecasting.run_pipeline(root / "features", root / "forecast", tracking,
-                    max_train_rows=100, n_estimators=5, comparison_id="sample")
+                    max_train_rows=100, n_estimators=5, pipeline_run_id="sample")
                 rec = recommendation.run_pipeline(root / "olist.duckdb", root / "rec", tracking,
-                    candidate_limit=5, top_k=3, n_estimators=5, comparison_id="sample")
+                    candidate_limit=5, top_k=3, n_estimators=5, pipeline_run_id="sample")
                 self.assertEqual(forecast["role"], "candidate")
                 self.assertEqual(rec["role"], "candidate")
+                self.assertEqual(forecast["pipeline_run_id"], "sample")
+                self.assertEqual(rec["pipeline_run_id"], "sample")
                 self.assertFalse((root / "models").exists())
                 decisions = compare_models("sample", tracking, root / "models", root / "comparisons")
                 self.assertEqual(decisions["forecasting"]["candidate_run_id"], forecast["mlflow_run_id"])
