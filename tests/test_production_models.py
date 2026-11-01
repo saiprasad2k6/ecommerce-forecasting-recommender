@@ -19,9 +19,9 @@ from src.models import common
 from src.models.forecasting import forecasting_lightgbm as forecasting
 from src.models.recommendation import recommendation_lightgbm as recommendation
 from src.models.forecasting.forecasting_lightgbm import ProductionForecaster
-from src.models.recommendation.recommendation_lightgbm import (
-    RecommendationSnapshot,
-)
+from src.models.forecasting.forecasting_baseline import BaselineForecaster, predict_baseline as predict_forecast_baseline
+from src.models.datasets import RecommendationSnapshot, RANK_FEATURES, load_history, load_labels
+from src.models.recommendation.recommendation_baseline import predict_baseline
 
 
 @contextmanager
@@ -103,18 +103,19 @@ class ProductionModelTests(unittest.TestCase):
             sample = frame.loc[frame.product_id.eq("p0")].tail(10)
             # The synthetic series repeats weekly: the correctly aligned weekly
             # prediction must equal tomorrow's label, not today's lag_7.
-            np.testing.assert_array_equal(forecasting.predict_baseline(sample, "same_day_last_week"), sample.target_demand_next_day)
-            np.testing.assert_allclose(forecasting.predict_baseline(sample, "moving_average_7"), 3)
+            np.testing.assert_array_equal(predict_forecast_baseline(sample, "same_day_last_week"), sample.target_demand_next_day)
+            np.testing.assert_allclose(predict_forecast_baseline(sample, "moving_average_7"), 3)
             start = pd.Timestamp(metadata["date_ranges"]["validation"]["min"])
-            sampled, _, weights, _, population = forecasting.prepare_data(root, 40, 42)
+            sampled, _, weights, _ = forecasting.prepare_data(root, 40, 42)
+            population = (frame.purchase_date + pd.Timedelta(days=1)).lt(start).sum()
             self.assertLessEqual(len(sampled), 40)
             self.assertTrue(((sampled.purchase_date + pd.Timedelta(days=1)) < start).all())
             self.assertAlmostEqual(weights.sum(), population)
 
             # Prepared lags must keep their meaning when reading a split directly.
             test_start = pd.Timestamp(metadata["date_ranges"]["test"]["min"])
-            weekly_model = ProductionForecaster(use_model=False, fallback="same_day_last_week")
-            metrics, _ = forecasting.evaluate_model(weekly_model, root, "validation", test_start)
+            weekly_model = BaselineForecaster("same_day_last_week")
+            metrics, _ = forecasting.evaluate_model({"lightgbm": weekly_model}, root, "validation", test_start)
             expected_rows = frame.loc[
                 frame.purchase_date.ge(start)
                 & (frame.purchase_date + pd.Timedelta(days=1)).lt(test_start)
@@ -166,8 +167,8 @@ class ProductionModelTests(unittest.TestCase):
                          "rolling_std_7", "rolling_mean_28"]:
                 frame[name] = 0.0
             frame.to_parquet(root / "test.parquet", index=False)
-            model = ProductionForecaster(use_model=False, fallback="last_day")
-            metrics, _ = forecasting.evaluate_model(model, root, "test")
+            model = BaselineForecaster("last_day")
+            metrics, _ = forecasting.evaluate_model({"lightgbm": model}, root, "test")
             actual, predicted = frame.target_demand_next_day, frame.demand
             self.assertEqual(metrics["lightgbm"]["rows"], len(frame))
             self.assertAlmostEqual(metrics["lightgbm"]["mae"],
@@ -177,7 +178,7 @@ class ProductionModelTests(unittest.TestCase):
             self.assertEqual(set(metrics["lightgbm"]), {"rows", "mae", "rmse"})
 
             from src.models.evaluation import evaluate_forecasting
-            zero_model = ProductionForecaster(use_model=False, fallback="always_zero")
+            zero_model = BaselineForecaster("always_zero")
             together, varying = evaluate_forecasting({"last_day": model, "zero": zero_model}, root, "test")
             self.assertEqual(together["last_day"], metrics["lightgbm"])
             self.assertAlmostEqual(together["zero"]["mae"], actual.mean())
@@ -187,7 +188,7 @@ class ProductionModelTests(unittest.TestCase):
 
             frame["target_demand_next_day"] = 0
             frame.to_parquet(root / "test.parquet", index=False)
-            zero_metrics, _ = forecasting.evaluate_model(model, root, "test")
+            zero_metrics, _ = forecasting.evaluate_model({"lightgbm": model}, root, "test")
             self.assertAlmostEqual(zero_metrics["lightgbm"]["mae"], predicted.mean())
             self.assertTrue(np.isfinite(zero_metrics["lightgbm"]["rmse"]))
 
@@ -226,7 +227,7 @@ class ProductionModelTests(unittest.TestCase):
             self.assertFalse((root / "model.pkl").exists())
 
     def test_baseline_pipelines_log_only_basic_metrics(self):
-        from src.models.forecasting.forecasting_baseline import run_baseline_pipeline
+        from src.models.forecasting.forecasting_baseline import run_pipeline as run_forecasting_baselines
         from src.models.recommendation.recommendation_baseline import run_pipeline as run_recommendation_baselines
 
         with tempfile.TemporaryDirectory() as directory:
@@ -234,9 +235,9 @@ class ProductionModelTests(unittest.TestCase):
             forecast_fixture(root / "features")
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
-                forecasting = run_baseline_pipeline(root / "features", root / "forecast", tracking)
+                forecasting = run_forecasting_baselines(root / "features", root / "forecast", tracking)
                 recommendations = run_recommendation_baselines(
-                    root / "olist.duckdb", root / "recommendations", tracking, k=3
+                    root / "olist.duckdb", root / "recommendations", tracking, top_k=3
                 )
             client = common.mlflow.MlflowClient(tracking_uri=tracking)
             for result in forecasting["runs"]:
@@ -251,7 +252,7 @@ class ProductionModelTests(unittest.TestCase):
 
     def test_ranker_stops_after_twenty_rounds_without_validation_improvement(self):
         # Constant features make validation precision plateau, so the callback must stop.
-        features = pd.DataFrame(0.0, index=range(40), columns=recommendation.NUMERIC_FEATURES)
+        features = pd.DataFrame(0.0, index=range(40), columns=RANK_FEATURES)
         train = (features, np.tile([1, 0, 0, 0], 10), [4] * 10)
         validation = (features.copy(), np.tile([0, 0, 0, 1], 10), [4] * 10)
         model = recommendation.train_model(train, validation, n_estimators=100, top_k=3)
@@ -263,7 +264,7 @@ class ProductionModelTests(unittest.TestCase):
         self.assertEqual(estimator.best_score_["validation"]["precision_at_k"], 0.0)
 
     def test_ranker_early_stopping_precision_averages_customers_equally(self):
-        features = pd.DataFrame(0.0, index=range(6), columns=recommendation.NUMERIC_FEATURES)
+        features = pd.DataFrame(0.0, index=range(6), columns=RANK_FEATURES)
         data = (features, np.array([1, 0, 1, 1, 0, 0]), [2, 4])
         validation = (features.copy(), data[1].copy(), [2, 4])
         model = recommendation.train_model(data, validation, n_estimators=25, top_k=2)
@@ -325,7 +326,6 @@ class ProductionModelTests(unittest.TestCase):
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
                 report = recommendation.run_pipeline(root / "olist.duckdb", root / "outputs", tracking, candidate_limit=5, top_k=3, n_estimators=5)
-            from src.models.recommendation.recommendation_baseline import load_history
             cutoff = pd.Timestamp("2018-08-01")
             snapshot = RecommendationSnapshot(load_history(root / "olist.duckdb", cutoff), cutoff, 5)
             features = snapshot.prepare_features("c1").loc["p1"]
@@ -343,16 +343,18 @@ class ProductionModelTests(unittest.TestCase):
             model = joblib.load(Path(report["output_dir"]) / "model.pkl")
             self.assertIn("precision_at_k", model.estimator.best_score_["validation"])
             self.assertGreater(model.estimator.best_iteration_, 0)
-            self.assertEqual(report["params"]["early_stopping_metric"], "precision_at_k")
+            self.assertEqual(set(report["params"]), {
+                "training_start", "seed", "n_estimators", "k", "candidate_limit",
+            })
             products = model.predict(snapshot, "c1", 3)
             self.assertEqual(len(products), len(set(products)))
             self.assertTrue(set(products).issubset(snapshot.catalog))
             unknown = model.predict(snapshot, "new-customer", 3)
             self.assertEqual(len(unknown), 3)
             self.assertFalse("future-product" in snapshot.prepare_features("c1").index)
-            self.assertEqual(len(recommendation.predict_baseline(snapshot, "category_popularity", "c1", 1)), 1)
-            self.assertEqual(len(recommendation.predict_baseline(snapshot, "category_popularity", "c1", 3)), 3)
-            labels = recommendation._load_labels(root / "olist.duckdb", pd.Timestamp("2018-07-01"), cutoff, pd.Timestamp("2018-07-06"))
+            self.assertEqual(len(predict_baseline(snapshot, "category_popularity", "c1", 1)), 1)
+            self.assertEqual(len(predict_baseline(snapshot, "category_popularity", "c1", 3)), 3)
+            labels = load_labels(root / "olist.duckdb", pd.Timestamp("2018-07-01"), cutoff, pd.Timestamp("2018-07-06"))
             self.assertTrue(labels.empty, "Labels delivered after known_by must not be used")
             self.assertIn("mlflow_run_id", report)
             client = common.mlflow.MlflowClient(tracking_uri=tracking)

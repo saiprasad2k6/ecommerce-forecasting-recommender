@@ -1,24 +1,25 @@
 """Train and log a next-day LightGBM candidate, independently of baselines."""
+
 import argparse
 import json
 from pathlib import Path
+
 import duckdb
 from lightgbm import LGBMRegressor, early_stopping
 import numpy as np
 import pandas as pd
-from src.models.forecasting.forecasting_baseline import METHODS as BASELINES, predict_baseline
-from src.models.datasets import NUMERIC_FEATURES, READ_COLUMNS, feature_query as _feature_query
-from src.models.evaluation import evaluate_forecasting
+
+from src.models.datasets import NUMERIC_FEATURES, feature_query
+from src.models.evaluation import evaluate_forecasting as evaluate_model
 from src.models.common import ROOT, TRACKING_URI, forecast_context, save_run
 
-class ProductionForecaster:
-    """Persisted encoder, trained estimator and validation-selected fallback."""
 
-    def __init__(self, estimator=None, encodings=None, fallback="last_day", use_model=True):
+class ProductionForecaster:
+    """Encode forecasting features and predict using the trained estimator."""
+
+    def __init__(self, estimator, encodings):
         self.estimator = estimator
-        self.encodings = encodings or {}
-        self.fallback = fallback
-        self.use_model = use_model
+        self.encodings = encodings
 
     def prepare_features(self, frame):
         result = frame[NUMERIC_FEATURES].astype("float32")
@@ -32,11 +33,7 @@ class ProductionForecaster:
         return result
 
     def predict(self, frame):
-        if not self.use_model:
-            return predict_baseline(frame, self.fallback)
         return np.maximum(self.estimator.predict(self.prepare_features(frame)), 0)
-
-    encode = prepare_features  # Keep existing notebook examples working.
 
 
 def prepare_data(features_dir, max_rows=1_000_000, seed=42):
@@ -53,7 +50,7 @@ def prepare_data(features_dir, max_rows=1_000_000, seed=42):
     ):
         raise ValueError("Feature splits overlap or are not chronological")
 
-    base = _feature_query(features_dir, "train", validation_start)
+    base = feature_query(features_dir, "train", validation_start)
     with duckdb.connect() as db:
         db.execute("SET threads=2")
         total, positive = db.sql(f"""
@@ -81,7 +78,7 @@ def prepare_data(features_dir, max_rows=1_000_000, seed=42):
             """).df()
             frames.append(sampled)
             weights.extend([population / len(sampled)] * len(sampled))
-        query = _feature_query(features_dir, "validation", test_start)
+        query = feature_query(features_dir, "validation", test_start)
         validation = db.sql(f"""
             SELECT * FROM ({query})
             USING SAMPLE reservoir(200000 ROWS) REPEATABLE ({seed})
@@ -89,24 +86,27 @@ def prepare_data(features_dir, max_rows=1_000_000, seed=42):
     if validation.empty:
         raise ValueError("Validation is empty after purging its label boundary")
     train = pd.concat(frames, ignore_index=True)
-    return train, validation, np.asarray(weights), metadata, total
+    return train, validation, np.asarray(weights), metadata
 
 
 def train_model(train, validation, weights, n_estimators=100, seed=42):
     """Fit a next-day forecaster; validation MAE controls early stopping."""
-    if n_estimators < 1:
-        raise ValueError("n-estimators must be positive")
     encodings = {
         column: pd.Index(sorted(train[column].unique()))
         for column in ["product_id", "customer_state"]
     }
     estimator = LGBMRegressor(
-        objective="poisson", metric="mae", n_estimators=n_estimators,
-        random_state=seed, n_jobs=2, verbosity=-1,
+        objective="poisson",
+        metric="mae",
+        n_estimators=n_estimators,
+        random_state=seed,
+        n_jobs=2,
+        verbosity=-1,
     )
     model = ProductionForecaster(estimator, encodings)
     estimator.fit(
-        model.prepare_features(train), train.target_demand_next_day,
+        model.prepare_features(train),
+        train.target_demand_next_day,
         sample_weight=weights,
         categorical_feature=["product_id_code", "customer_state_code"],
         eval_X=model.prepare_features(validation),
@@ -116,41 +116,64 @@ def train_model(train, validation, weights, n_estimators=100, seed=42):
     return model
 
 
-def evaluate_model(model, features_dir, split, label_before=None):
-    metrics, varying = evaluate_forecasting({"lightgbm": model}, features_dir, split, label_before)
-    return metrics, varying["lightgbm"]
-
-
-def run_pipeline(features_dir=ROOT / "data/features/forecasting", output_dir=ROOT / "data/production/lightgbm/forecasting",
-                 tracking_uri=TRACKING_URI, max_train_rows=1_000_000, n_estimators=100, seed=42, pipeline_run_id=None):
+def run_pipeline(
+    features_dir=ROOT / "data/features/forecasting",
+    output_dir=ROOT / "data/production/lightgbm/forecasting",
+    tracking_uri=TRACKING_URI,
+    max_train_rows=1_000_000,
+    n_estimators=100,
+    seed=42,
+    pipeline_run_id=None,
+):
     context = forecast_context(features_dir)
-    train, validation, weights, metadata, population = prepare_data(features_dir, max_train_rows, seed)
+    train, validation, weights, metadata = prepare_data(
+        features_dir, max_train_rows, seed
+    )
     model = train_model(train, validation, weights, n_estimators, seed)
+
     boundary = pd.Timestamp(metadata["boundaries"]["test_start"])
-    validation_metrics, varying = evaluate_model(model, features_dir, "validation", boundary)
-    test_metrics, _ = evaluate_model(model, features_dir, "test")
+    models = {"lightgbm": model}
+    validation_metrics, varying = evaluate_model(models, features_dir, "validation", boundary)
+    test_metrics, _ = evaluate_model(models, features_dir, "test")
+
     if context != forecast_context(features_dir):
         raise ValueError("Evaluation data changed during training")
-    report = {"task": "forecasting", "role": "candidate", "model": "lightgbm",
-              "validation": validation_metrics["lightgbm"], "test": test_metrics["lightgbm"],
-              "prediction_varies": varying, "evaluation_context": context}
-    params = {"target": "target_demand_next_day", "training_rows": len(train),
-              "training_population_rows": population, "max_train_rows": max_train_rows,
-              "seed": seed, "n_estimators": n_estimators, "trained_estimators": model.estimator.n_estimators_}
-    return save_run(model, report, params, output_dir, tracking_uri, "ecommerce-demand-forecasting", pipeline_run_id)
+
+    report = {
+        "task": "forecasting",
+        "role": "candidate",
+        "model": "lightgbm",
+        "validation": validation_metrics["lightgbm"],
+        "test": test_metrics["lightgbm"],
+        "prediction_varies": varying["lightgbm"],
+        "evaluation_context": context,
+    }
+    params = {
+        "max_train_rows": max_train_rows,
+        "n_estimators": n_estimators,
+        "seed": seed,
+    }
+    return save_run(
+        model, report, params, output_dir, tracking_uri,
+        "ecommerce-demand-forecasting", pipeline_run_id,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--features-dir", type=Path, default=ROOT / "data/features/forecasting")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/lightgbm/forecasting")
+    parser.add_argument(
+        "--features-dir", type=Path, default=ROOT / "data/features/forecasting"
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=ROOT / "data/production/lightgbm/forecasting"
+    )
     parser.add_argument("--pipeline-run-id")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
     parser.add_argument("--max-train-rows", type=int, default=1_000_000)
     parser.add_argument("--n-estimators", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    print(json.dumps(run_pipeline(**vars(args)), indent=2))
+    report = run_pipeline(**vars(parser.parse_args()))
+    print(f"Pipeline run: {report['pipeline_run_id']}")
     return 0
 
 

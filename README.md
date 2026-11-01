@@ -148,11 +148,19 @@ src/models/
     └── recommendation_lightgbm.py
 ```
 
-Both production modules follow the same procedure:
+Both LightGBM modules follow the same procedure:
 
 ```text
 prepare_data() → train_model() → evaluate_model() → save_run()
 ```
+
+All four modules expose `run_pipeline()`, `main()`, a model `predict()` method,
+and `evaluate_model` imported from the shared task evaluator. Evaluation always
+receives a dictionary of named models. Only LightGBM modules need `prepare_data()`
+and `train_model()`; baselines simply apply their prediction rules. The baseline
+modules also expose `predict_baseline()`. Recommendation pipelines use the same
+`warehouse` and `top_k` argument names. CLI output identifies the pipeline run;
+detailed metrics and model artifacts remain in MLflow.
 
 Baseline evaluation and trained models run independently from their task folders. Both use
 `src/models/datasets.py` for input validation, shared data loading and recommendation features, and
@@ -282,7 +290,7 @@ Saved models use the current module paths and load directly with `joblib.load()`
 - Training omits groups without positive/negative candidate variation because they supply no pairwise ranking signal. Evaluation retains all purchasing customers, including new customers and purchases outside the candidate/catalog pool.
 - Recommendation baselines and production models report only **Precision@K** (the fraction of recommendations purchased) and **Recall@K** (the fraction of purchases included in the recommendations). Higher is better. Both model and baselines use the same customers and delivery-outcome boundaries.
 - The ranker uses monthly validation ranking groups for early stopping, with historical features built before each snapshot and delivery outcomes known before the test cutoff. It monitors Precision@K and stops after 20 rounds without improvement, up to `ranking_estimators` rounds. Training and early-stopping groups require both positive and negative candidates; final evaluation still includes all purchasing customers.
-- Precision@K is supplied to LightGBM through a small evaluation callback because it is not a built-in ranking metric. MLflow performance metrics remain Precision@K and Recall@K; parameters record the stopping metric, patience and trained tree count. Validation selects the baseline by Recall@K, with Precision@K as a tiebreaker; test checks the frozen model and is not passed to `fit()`.
+- Precision@K is supplied to LightGBM through a small evaluation callback because it is not a built-in ranking metric. MLflow records Precision@K and Recall@K, plus the training start, random seed, estimator limit, K and candidate limit. Early stopping waits 20 rounds without validation improvement. Validation selects the baseline by Recall@K, with Precision@K as a tiebreaker; test checks the frozen model and is not passed to `fit()`.
 - Inventory, recalls, views, brands and promotions are not supplied by Olist and are not fabricated.
 
 ### Model files and release checks
@@ -316,7 +324,7 @@ New runs log only these two performance metrics per task for validation and test
 | `models/forecast_model.pkl` | `joblib.load(path).predict(feature_frame)` |
 | `models/recommender.pkl` | `joblib.load(path).predict(snapshot, customer_id, k)` |
 
-A rejected candidate never replaces an existing active file. On the first run, a baseline fallback bundle is written if the candidate fails. Inspect `approved`, `validation_approved`, `holdout_passed` and `publication` in the comparison report; successful training/DAG execution does not mean the learned model was approved. Load `.pkl` bundles only from trusted runs in this repository. They include the estimator and preprocessing/fallback configuration and can be loaded with `joblib.load()`.
+A rejected candidate never replaces an existing active file. On the first run, a baseline fallback bundle is written if the candidate fails. Inspect `approved`, `validation_approved`, `holdout_passed` and `publication` in the comparison report; successful training/DAG execution does not mean the learned model was approved. Load `.pkl` bundles only from trusted runs in this repository. They contain the estimator and preprocessing, or the selected baseline rule and can be loaded with `joblib.load()`.
 
 To use the saved recommendation bundle:
 
@@ -333,7 +341,7 @@ model = joblib.load("models/recommender.pkl")
 products = model.predict(snapshot, "CUSTOMER_UNIQUE_ID", k=10)
 ```
 
-The forecasting frame must contain observed demand, historical lag/rolling columns, date, product and state. Weekly/28-day fallback rules additionally require `demand_lag_6`/`demand_lag_27`; they do not require a future target column. These scripts provide training, backtesting and local inference artifacts; live feature generation, an API deployment and live inventory eligibility are separate work.
+The forecasting frame must contain observed demand, historical lag/rolling columns, date, product and state. Weekly/28-day baseline rules additionally require `demand_lag_6`/`demand_lag_27`; they do not require a future target column. These scripts provide training, backtesting and local inference artifacts; live feature generation, an API deployment and live inventory eligibility are separate work.
 
 ## Batch inference from the selected model
 

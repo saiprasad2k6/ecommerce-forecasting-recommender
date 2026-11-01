@@ -6,7 +6,7 @@ import unittest
 import pandas as pd
 
 from src.common.config import REPLAY
-from src.models.forecasting.forecasting_baseline import evaluate_baselines_duckdb
+from src.models.forecasting.forecasting_baseline import BaselineForecaster, evaluate_model
 from src.features.build_forecasting_features import build_features, split_features, write_outputs
 
 
@@ -40,8 +40,11 @@ class ForecastingReplayTests(unittest.TestCase):
             metadata = write_outputs(splits, root / "output", **boundaries)
             self.assertEqual(metadata["boundaries"], boundaries)
             self.assertTrue((root / "output/inference.parquet").is_file())
-            metrics = evaluate_baselines_duckdb(root / "output/validation.parquet", "validation")
-            self.assertTrue(metrics.rows.eq(30).all())
+            metrics, _ = evaluate_model(
+                {"weekly": BaselineForecaster("same_day_last_week")},
+                root / "output", "validation", pd.Timestamp(REPLAY["test_start"]),
+            )
+            self.assertEqual(metrics["weekly"]["rows"], 30)
             # Products first seen later must not create earlier product/state rows.
             later = root / "purchase_date=2018-08-06"
             later.mkdir()

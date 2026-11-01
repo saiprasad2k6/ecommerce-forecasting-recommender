@@ -1,12 +1,14 @@
 """Evaluate recommendation rules separately from ranker training."""
+
 import argparse
-import json
 from pathlib import Path
 from uuid import uuid4
+
 import pandas as pd
+
 from src.common.config import REPLAY, SETTINGS
 from src.models.datasets import RecommendationSnapshot, load_history, load_labels
-from src.models.evaluation import evaluate_recommendations
+from src.models.evaluation import evaluate_recommendations as evaluate_model
 from src.models.common import ROOT, TRACKING_URI, recommendation_context, save_run
 
 METHODS = ["global_popularity", "category_popularity", "purchase_history"]
@@ -37,26 +39,47 @@ class BaselineRecommender:
         return predict_baseline(snapshot, self.method, customer, k)
 
 
-def run_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duckdb",
-        output_dir=ROOT / "data/baselines/recommendations", tracking_uri=TRACKING_URI,
-        experiment_name="ecommerce-recommendations", k=SETTINGS["recommendation"]["top_k"],
-        candidate_limit=SETTINGS["recommendation"]["candidate_limit"],
-        validation_cutoff=REPLAY["validation_start"], test_cutoff=REPLAY["test_start"], test_end=REPLAY["monitoring_start"], pipeline_run_id=None):
-    if not 1 <= k <= candidate_limit:
+def run_pipeline(
+    warehouse=ROOT / "data/warehouse/olist.duckdb",
+    output_dir=ROOT / "data/baselines/recommendations",
+    tracking_uri=TRACKING_URI,
+    validation_cutoff=REPLAY["validation_start"],
+    test_cutoff=REPLAY["test_start"],
+    test_end=REPLAY["monitoring_start"],
+    candidate_limit=SETTINGS["recommendation"]["candidate_limit"],
+    top_k=SETTINGS["recommendation"]["top_k"],
+    pipeline_run_id=None,
+):
+    if not 1 <= top_k <= candidate_limit:
         raise ValueError("Require 1 <= top-k <= candidate-limit")
-    validation_start, test_start, end = map(pd.Timestamp, [validation_cutoff, test_cutoff, test_end])
+    validation_start, test_start, end = map(
+        pd.Timestamp, [validation_cutoff, test_cutoff, test_end]
+    )
     if not validation_start < test_start < end:
         raise ValueError("Evaluation dates must be chronological")
+
     pipeline_run_id = pipeline_run_id or uuid4().hex
-    context = recommendation_context(warehouse_path, validation_start, test_start, end, candidate_limit, k)
+    context = recommendation_context(
+        warehouse, validation_start, test_start, end, candidate_limit, top_k
+    )
     models = {name: BaselineRecommender(name) for name in METHODS}
+
     scores = {}
-    for split, start, stop in [("validation", validation_start, test_start), ("test", test_start, end)]:
-        snapshot = RecommendationSnapshot(load_history(warehouse_path, start), start, candidate_limit)
-        labels = load_labels(warehouse_path, start, stop)
-        scores[split] = evaluate_recommendations(models, snapshot, labels, k)
-    if context != recommendation_context(warehouse_path, validation_start, test_start, end, candidate_limit, k):
+    for split, start, stop in [
+        ("validation", validation_start, test_start),
+        ("test", test_start, end),
+    ]:
+        snapshot = RecommendationSnapshot(
+            load_history(warehouse, start), start, candidate_limit
+        )
+        labels = load_labels(warehouse, start, stop)
+        scores[split] = evaluate_model(models, snapshot, labels, top_k)
+
+    if context != recommendation_context(
+        warehouse, validation_start, test_start, end, candidate_limit, top_k
+    ):
         raise ValueError("Evaluation data changed during baseline evaluation")
+
     runs = []
     for name, model in models.items():
         report = {
@@ -65,23 +88,31 @@ def run_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duckdb",
             "evaluation_context": context,
         }
         runs.append(save_run(
-            model, report, {"k": k, "candidate_limit": candidate_limit},
-            output_dir, tracking_uri, experiment_name, pipeline_run_id,
+            model, report, {"k": top_k, "candidate_limit": candidate_limit},
+            output_dir, tracking_uri, "ecommerce-recommendations", pipeline_run_id,
         ))
     return {"pipeline_run_id": pipeline_run_id, "runs": runs}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--warehouse", dest="warehouse_path", type=Path, default=ROOT / "data/warehouse/olist.duckdb")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/baselines/recommendations")
+    parser.add_argument(
+        "--warehouse", type=Path, default=ROOT / "data/warehouse/olist.duckdb"
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=ROOT / "data/baselines/recommendations"
+    )
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
-    parser.add_argument("--experiment-name", default="ecommerce-recommendations")
-    parser.add_argument("--top-k", dest="k", type=int, default=SETTINGS["recommendation"]["top_k"])
-    parser.add_argument("--candidate-limit", type=int, default=SETTINGS["recommendation"]["candidate_limit"])
+    parser.add_argument(
+        "--top-k", type=int, default=SETTINGS["recommendation"]["top_k"]
+    )
+    parser.add_argument(
+        "--candidate-limit", type=int, default=SETTINGS["recommendation"]["candidate_limit"]
+    )
     parser.add_argument("--validation-cutoff", default=REPLAY["validation_start"])
     parser.add_argument("--test-cutoff", default=REPLAY["test_start"])
     parser.add_argument("--test-end", default=REPLAY["monitoring_start"])
     parser.add_argument("--pipeline-run-id")
-    print(json.dumps(run_pipeline(**vars(parser.parse_args())), indent=2))
+    report = run_pipeline(**vars(parser.parse_args()))
+    print(f"Pipeline run: {report['pipeline_run_id']}")
     return 0
