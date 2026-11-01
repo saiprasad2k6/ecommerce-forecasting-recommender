@@ -7,6 +7,27 @@ data:
 models:
   forecast_model_path: models/forecast_model.pkl
   recommender_model_path: models/recommender.pkl
+# Exclusive boundaries; forecasting splits are based on next-day target dates.
+replay:
+  training_start: "2018-03-01"  # Recommendation training snapshots
+  validation_start: "2018-06-01"
+  test_start: "2018-07-01"
+  monitoring_start: "2018-08-01"
+  monitoring_end: "2018-09-01"
+recommendation:
+  top_k: 10
+  candidate_limit: 100
+inference:
+  as_of: "2018-08-01"
+  forecast_features: data/features/forecasting/inference.parquet
+  warehouse: data/warehouse/olist.duckdb
+  models_dir: models
+  output_dir: data/predictions
+# Proposed settings; the monitoring job is not implemented yet.
 monitoring:
-  drift_output_path: artifacts/drift_report.json
-  retraining_threshold: 0.2
+  window_days: 7
+  recommendation_horizon_days: 7
+  forecast_metrics: [mae, rmse]
+  recommendation_metrics: [precision_at_k, recall_at_k]
+  automatic_retraining: false
+  output_dir: data/monitoring

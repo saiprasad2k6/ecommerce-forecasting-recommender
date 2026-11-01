@@ -15,9 +15,11 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from src.models.comparison import forecast_gate, ranking_gate
-from src.models.production import common, forecasting, recommendation
-from src.models.production.forecasting import ProductionForecaster
-from src.models.production.recommendation import (
+from src.models import common
+from src.models.forecasting import forecasting_lightgbm as forecasting
+from src.models.recommendation import recommendation_lightgbm as recommendation
+from src.models.forecasting.forecasting_lightgbm import ProductionForecaster
+from src.models.recommendation.recommendation_lightgbm import (
     RecommendationSnapshot,
 )
 
@@ -58,6 +60,10 @@ def forecast_fixture(root):
         metadata["rows"][name] = len(data)
         metadata["date_ranges"][name] = {"min": data.purchase_date.min().strftime("%Y-%m-%d"),
                                          "max": data.purchase_date.max().strftime("%Y-%m-%d")}
+    metadata["boundaries"] = {
+        "validation_start": metadata["date_ranges"]["validation"]["min"],
+        "test_start": metadata["date_ranges"]["test"]["min"],
+    }
     (root / "metadata.json").write_text(json.dumps(metadata))
     return frame, metadata
 
@@ -119,9 +125,25 @@ class ProductionModelTests(unittest.TestCase):
             # Older feature files get a clear rebuild instruction at preflight.
             test_path = root / "test.parquet"
             pd.read_parquet(test_path).drop(columns="demand_lag_6").to_parquet(test_path)
-            from src.models.production.validate_inputs import validate_inputs
+            from src.models.datasets import validate_inputs
             with self.assertRaisesRegex(ValueError, "rebuild forecasting features"):
                 validate_inputs(root, root / "unused.duckdb")
+
+    def test_input_validation_checks_metadata_and_accepts_quoted_paths(self):
+        from src.models.datasets import validate_inputs
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            features = root / "customer's features"
+            _, metadata = forecast_fixture(features)
+            warehouse = root / "olist.duckdb"
+            warehouse_fixture(warehouse)
+            self.assertEqual(validate_inputs(features, warehouse)["status"], "ready")
+
+            metadata["rows"]["test"] += 1
+            (features / "metadata.json").write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError, "does not match metadata"):
+                validate_inputs(features, warehouse)
 
     def test_rejected_candidate_preserves_existing_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,8 +226,8 @@ class ProductionModelTests(unittest.TestCase):
             self.assertFalse((root / "model.pkl").exists())
 
     def test_baseline_pipelines_log_only_basic_metrics(self):
-        from src.models.baseline.forecasting_baselines import run_baseline_pipeline
-        from src.models.baseline.recommendation_baselines import run_recommendation_pipeline
+        from src.models.forecasting.forecasting_baseline import run_baseline_pipeline
+        from src.models.recommendation.recommendation_baseline import run_recommendation_pipeline
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -269,13 +291,41 @@ class ProductionModelTests(unittest.TestCase):
             _, _, groups = recommendation.prepare_data(warehouse, start, end, candidate_limit=5)
             self.assertEqual(len(groups), len(original[2]) - 1)
 
+    def test_snapshot_handles_old_products_other_states_and_inactive_customers(self):
+        history = pd.DataFrame({
+            "order_id": ["o1", "o2", "o3", "o4", "o5"],
+            "customer_unique_id": ["c1", "c1", "c1", "c2", "c3"],
+            "product_id": ["old", "p1", "p1", "p2", "p3"],
+            "customer_state": ["RJ", "SP", "SP", "RJ", "SP"],
+            "category": ["home", "sport", "sport", "sport", "home"],
+            "purchased_at": pd.to_datetime(["2018-01-01", "2018-06-01", "2018-06-15", "2018-06-20", "2018-06-25"]),
+        })
+        snapshot = RecommendationSnapshot(history, pd.Timestamp("2018-07-01"), candidate_limit=2)
+        features = snapshot.prepare_features("c1")
+        self.assertEqual(features.index.tolist(), ["p1", "p2", "old"])
+        self.assertAlmostEqual(features.loc["p1", "regional_recent"], np.log1p(2), places=6)
+        self.assertAlmostEqual(features.loc["p2", "category_popularity"], np.log1p(3), places=6)
+        self.assertEqual(features.loc["p2", "regional_recent"], 0)
+        self.assertEqual(features.loc["p2", "customer_frequency"], 0)
+        self.assertEqual(features.loc["p2", "days_since_purchase"], -1)
+        self.assertEqual(features.loc["old", "global_recent"], 0)
+        self.assertEqual(features.loc["old", "category_affinity"], 0)
+        self.assertEqual(features.loc["old", "product_age_days"], 181)
+        self.assertEqual(features.loc["p1", "days_since_purchase"], 16)
+
+        inactive = RecommendationSnapshot(history, pd.Timestamp("2020-07-01"), candidate_limit=2)
+        self.assertEqual(inactive.global_order, ["p1", "old", "p2", "p3"])
+        features = inactive.prepare_features("new-customer")
+        self.assertTrue(features[["global_recent", "regional_recent", "category_popularity", "category_affinity"]].eq(0).all().all())
+        self.assertTrue(features.days_since_purchase.eq(-1).all())
+
     def test_recommendation_training_retrieval_and_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
                 report = recommendation.run_pipeline(root / "olist.duckdb", root / "outputs", tracking, candidate_limit=5, top_k=3, n_estimators=5)
-            from src.models.baseline.recommendation_baselines import load_history
+            from src.models.recommendation.recommendation_baseline import load_history
             cutoff = pd.Timestamp("2018-08-01")
             snapshot = RecommendationSnapshot(load_history(root / "olist.duckdb", cutoff), cutoff, 5)
             features = snapshot.prepare_features("c1").loc["p1"]

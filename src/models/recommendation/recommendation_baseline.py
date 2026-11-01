@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 from uuid import uuid4
 import pandas as pd
-from src.models.evaluation import RecommendationSnapshot, load_history, load_labels, ranking_metrics, evaluate_recommendations
-from src.models.production.common import ROOT, TRACKING_URI, recommendation_context, save_run
+from src.common.config import REPLAY, SETTINGS
+from src.models.datasets import RecommendationSnapshot, load_history, load_labels
+from src.models.evaluation import ranking_metrics, evaluate_recommendations
+from src.models.common import ROOT, TRACKING_URI, recommendation_context, save_run
 
 METHODS = ["global_popularity", "category_popularity", "purchase_history"]
 RECENT_DAYS = 90
@@ -46,8 +48,9 @@ class BaselineRecommender:
 
 def run_recommendation_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duckdb",
         output_dir=ROOT / "data/baselines/recommendations", tracking_uri=TRACKING_URI,
-        experiment_name="ecommerce-recommendations", k=10, candidate_limit=100,
-        validation_cutoff="2018-07-01", test_cutoff="2018-08-01", test_end="2018-09-01", pipeline_run_id=None):
+        experiment_name="ecommerce-recommendations", k=SETTINGS["recommendation"]["top_k"],
+        candidate_limit=SETTINGS["recommendation"]["candidate_limit"],
+        validation_cutoff=REPLAY["validation_start"], test_cutoff=REPLAY["test_start"], test_end=REPLAY["monitoring_start"], pipeline_run_id=None):
     if not 1 <= k <= candidate_limit:
         raise ValueError("Require 1 <= top-k <= candidate-limit")
     validation_start, test_start, end = map(pd.Timestamp, [validation_cutoff, test_cutoff, test_end])
@@ -80,11 +83,11 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/baselines/recommendations")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
     parser.add_argument("--experiment-name", default="ecommerce-recommendations")
-    parser.add_argument("--top-k", dest="k", type=int, default=10)
-    parser.add_argument("--candidate-limit", type=int, default=100)
-    parser.add_argument("--validation-cutoff", default="2018-07-01")
-    parser.add_argument("--test-cutoff", default="2018-08-01")
-    parser.add_argument("--test-end", default="2018-09-01")
+    parser.add_argument("--top-k", dest="k", type=int, default=SETTINGS["recommendation"]["top_k"])
+    parser.add_argument("--candidate-limit", type=int, default=SETTINGS["recommendation"]["candidate_limit"])
+    parser.add_argument("--validation-cutoff", default=REPLAY["validation_start"])
+    parser.add_argument("--test-cutoff", default=REPLAY["test_start"])
+    parser.add_argument("--test-end", default=REPLAY["monitoring_start"])
     parser.add_argument("--pipeline-run-id")
     print(json.dumps(run_pipeline(**vars(parser.parse_args())), indent=2))
     return 0

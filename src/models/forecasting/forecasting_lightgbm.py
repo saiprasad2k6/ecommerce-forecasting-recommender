@@ -6,9 +6,10 @@ import duckdb
 from lightgbm import LGBMRegressor, early_stopping
 import numpy as np
 import pandas as pd
-from src.models.baseline.forecasting_baselines import METHODS as BASELINES, predict_baseline
-from src.models.evaluation import NUMERIC_FEATURES, READ_COLUMNS, feature_query as _feature_query, evaluate_forecasting
-from src.models.production.common import ROOT, TRACKING_URI, forecast_context, save_run
+from src.models.forecasting.forecasting_baseline import METHODS as BASELINES, predict_baseline
+from src.models.datasets import NUMERIC_FEATURES, READ_COLUMNS, feature_query as _feature_query
+from src.models.evaluation import evaluate_forecasting
+from src.models.common import ROOT, TRACKING_URI, forecast_context, save_run
 
 class ProductionForecaster:
     """Persisted encoder, trained estimator and validation-selected fallback."""
@@ -44,8 +45,8 @@ def prepare_data(features_dir, max_rows=1_000_000, seed=42):
         raise ValueError("max-train-rows must be at least 2")
     metadata = json.loads((features_dir / "metadata.json").read_text())
     ranges = metadata["date_ranges"]
-    validation_start = pd.Timestamp(ranges["validation"]["min"])
-    test_start = pd.Timestamp(ranges["test"]["min"])
+    validation_start = pd.Timestamp(metadata["boundaries"]["validation_start"])
+    test_start = pd.Timestamp(metadata["boundaries"]["test_start"])
     if (
         pd.Timestamp(ranges["train"]["max"]) >= validation_start
         or pd.Timestamp(ranges["validation"]["max"]) >= test_start
@@ -120,12 +121,12 @@ def evaluate_model(model, features_dir, split, label_before=None):
     return metrics, varying["lightgbm"]
 
 
-def run_pipeline(features_dir=ROOT / "data/features/forecasting", output_dir=ROOT / "data/production/forecasting",
+def run_pipeline(features_dir=ROOT / "data/features/forecasting", output_dir=ROOT / "data/production/lightgbm/forecasting",
                  tracking_uri=TRACKING_URI, max_train_rows=1_000_000, n_estimators=100, seed=42, pipeline_run_id=None):
     context = forecast_context(features_dir)
     train, validation, weights, metadata, population = prepare_data(features_dir, max_train_rows, seed)
     model = train_model(train, validation, weights, n_estimators, seed)
-    boundary = pd.Timestamp(metadata["date_ranges"]["test"]["min"])
+    boundary = pd.Timestamp(metadata["boundaries"]["test_start"])
     validation_metrics, varying = evaluate_model(model, features_dir, "validation", boundary)
     test_metrics, _ = evaluate_model(model, features_dir, "test")
     if context != forecast_context(features_dir):
@@ -142,7 +143,7 @@ def run_pipeline(features_dir=ROOT / "data/features/forecasting", output_dir=ROO
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features-dir", type=Path, default=ROOT / "data/features/forecasting")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/forecasting")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/lightgbm/forecasting")
     parser.add_argument("--pipeline-run-id")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
     parser.add_argument("--max-train-rows", type=int, default=1_000_000)

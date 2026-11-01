@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper for next-day forecasting model training."""
+"""CLI wrapper to run the recommendation baseline evaluation pipeline."""
 
 import sys
 from pathlib import Path
@@ -7,8 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
-from src.models.production.forecasting import main
-
+from src.models.recommendation.recommendation_baseline import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

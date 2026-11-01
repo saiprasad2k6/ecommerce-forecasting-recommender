@@ -26,15 +26,15 @@ scripts/
 │   ├── build_forecasting_features.py
 │   └── build_recommendation_features.py
 ├── models/
-│   ├── baseline/
-│   │   ├── forecasting_baselines.py
-│   │   └── recommendation_baselines.py
-│   ├── production/
-│   │   ├── validate_inputs.py
-│   │   ├── train_forecasting.py
-│   │   └── train_recommendation.py
-│   └── comparison/
-│       └── compare_models.py
+│   ├── forecasting/
+│   │   ├── forecasting_baseline.py
+│   │   └── forecasting_lightgbm.py
+│   ├── recommendation/
+│   │   ├── recommendation_baseline.py
+│   │   └── recommendation_lightgbm.py
+│   ├── comparison/
+│   │   └── compare_models.py
+│   └── validate_inputs.py
 └── maintenance/
     ├── cleanup_data.py
     └── reset_repository.py
@@ -48,7 +48,7 @@ Run commands from the repository root using the new paths:
 .venv/bin/python scripts/data/clean_olist_data.py
 .venv/bin/python scripts/data/prepare_curated_data.py
 .venv/bin/python scripts/features/build_forecasting_features.py
-.venv/bin/python scripts/models/baseline/forecasting_baselines.py
+.venv/bin/python scripts/models/forecasting/forecasting_baseline.py
 ```
 
 For recommendation features, supply a customer, state and historical cutoff:
@@ -56,14 +56,14 @@ For recommendation features, supply a customer, state and historical cutoff:
 ```bash
 .venv/bin/python scripts/features/build_recommendation_features.py \
   --customer-id CUSTOMER_UNIQUE_ID --state SP --as-of 2018-08-01
-.venv/bin/python scripts/models/baseline/recommendation_baselines.py --help
+.venv/bin/python scripts/models/recommendation/recommendation_baseline.py --help
 ```
 
-Use `--help` on any script to inspect its arguments. Import reusable functions from `src.data`, `src.features` or `src.models.baseline` in application code and notebooks.
+Use `--help` on any script to inspect its arguments. Import reusable functions from `src.data`, `src.features`, `src.models.forecasting` and `src.models.recommendation` in application code and notebooks.
 
-## Run the complete pipeline with Airflow
+## Prepare data and features with Airflow
 
-The DAG in `pipelines/data_pipeline.py` is named `olist_end_to_end_pipeline` and runs:
+The DAG in `pipelines/data_pipeline.py` is named `olist_data_preparation` and runs:
 
 ```text
 download_olist_data
@@ -72,11 +72,9 @@ download_olist_data
   → prepare_curated_data
   → build_forecasting_features
   → build_recommendation_features
-  → run_forecasting_baselines
-  → run_recommendation_baselines
 ```
 
-It is manually triggered, with one active run and one task at a time. Later tasks run only after their dependencies succeed. Complete raw downloads are reused; baseline retries can create additional MLflow runs.
+It is manually triggered, with one active run and one task at a time. Later tasks run only after their dependencies succeed. Complete raw downloads are reused. After it succeeds, trigger `olist_model_training` to evaluate baselines, train candidates, compare results and publish the selected models.
 
 Install `requirements.txt` in `.venv` and configure Kaggle authentication for the Airflow worker using `~/.kaggle/kaggle.json` or `KAGGLE_API_TOKEN`. The worker must have the Kaggle CLI and all project dependencies. Start a local development instance from the repository root:
 
@@ -99,15 +97,28 @@ export AIRFLOW__CORE__LOAD_EXAMPLES=False
 .venv/bin/airflow standalone
 ```
 
-Open the address printed by Airflow `http://localhost:8080.`, unpause `olist_end_to_end_pipeline` and trigger it. In another terminal with the same environment variables, you can also trigger it with:
+Open the address printed by Airflow `http://localhost:8080.`, unpause `olist_data_preparation` and trigger it. In another terminal with the same environment variables, you can also trigger it with:
 
 ```bash
-.venv/bin/airflow dags trigger olist_end_to_end_pipeline
+.venv/bin/airflow dags trigger olist_data_preparation
 ```
 
-The trigger form exposes `validation_days`, `test_days`, `recommendation_customer_id`, `recommendation_state`, `recommendation_as_of`, and `top_k`. Defaults are 30/30 days, `new-customer`, `SP`, `2018-08-01`, and 10. Set `recommendation_customer_id` to an actual `customer_unique_id` for personalized candidate features; the default uses the new-customer fallback. The recommendation cutoff should fall within the historical dataset, rather than today's date.
+Shared defaults live in `configs/settings.yaml`. The trigger form exposes
+`validation_start=2018-06-01`, `test_start=2018-07-01`,
+`monitoring_start=2018-08-01` and `monitoring_end=2018-09-01` (exclusive),
+plus the customer snapshot parameters (`new-customer`, `SP`, `2018-08-01`, K=10).
+Forecasting train/validation/test splits use **target dates**, not feature dates:
+May 31 features predict June 1 and belong to validation. August target outcomes
+are excluded from development splits. A separate `inference.parquet` contains
+August feature dates and does not require next-day labels.
 
-The recommendation feature task builds one customer snapshot. Recommendation baseline evaluation independently builds its historical customer cohorts from the warehouse using July/August 2018 evaluation periods. Both baseline programs log to `data/baselines/mlflow.db`, with separate forecasting and recommendation experiments; CSV outputs go to `data/baselines/forecasting/` and `data/baselines/recommendations/`.
+Keep replay boundaries identical in data preparation and training when overriding
+DAG parameters. Recommendation model jobs receive the same June validation, July
+test and August release boundaries. Forecasting training reads its boundaries from
+the generated feature metadata. Change the shared configuration before starting a
+new replay and rebuild the data rather than mixing outputs from different windows.
+
+The recommendation feature task builds one customer snapshot. In the separate `olist_model_training` DAG, recommendation baseline evaluation builds its historical customer cohorts from the warehouse using June/July 2018 evaluation periods. Both baseline programs log to `data/baselines/mlflow.db`, with separate forecasting and recommendation experiments; CSV outputs go to `data/baselines/forecasting/` and `data/baselines/recommendations/`.
 
 Every worker needs access to the same checkout and data directories. For another deployment location, set `OLIST_PROJECT_ROOT` to the checkout's absolute path and `OLIST_PYTHON` to the worker's absolute Python executable path. By default, the DAG uses the checkout's `.venv/bin/python` if present, otherwise Airflow's Python. The forecasting feature builder processes a large dense dataset in memory; provide enough worker memory for the full Olist run.
 
@@ -115,7 +126,27 @@ This DAG does not reset existing files or run at import time. Stop Airflow befor
 
 ## Train production model candidates
 
-Reusable implementations live in `src/models/production/`; CLI wrappers live in `scripts/models/production/`.
+Models are grouped by task: forecasting and recommendation. Filenames identify
+the task and algorithm, such as `forecasting_baseline.py`, `forecasting_lightgbm.py`
+and `recommendation_lightgbm.py`. Source implementations and CLI wrappers use the
+same layout under `src/models/` and `scripts/models/`. LightGBM is the currently
+implemented trained algorithm; additional models can be registered as separate jobs.
+
+Shared model support lives directly under `src/models/`:
+
+```text
+src/models/
+├── common.py
+├── datasets.py
+├── evaluation.py
+├── comparison.py
+├── forecasting/
+│   ├── forecasting_baseline.py
+│   └── forecasting_lightgbm.py
+└── recommendation/
+    ├── recommendation_baseline.py
+    └── recommendation_lightgbm.py
+```
 
 Both production modules follow the same procedure:
 
@@ -123,8 +154,10 @@ Both production modules follow the same procedure:
 prepare_data() → train_model() → evaluate_model() → save_run()
 ```
 
-Baseline evaluation runs independently under `src/models/baseline/`. Both jobs use
-`src/models/evaluation.py` for evaluation rows and metrics. Each job logs its own
+Baseline evaluation and trained models run independently from their task folders. Both use
+`src/models/datasets.py` for input validation, shared data loading and recommendation features, and
+`src/models/evaluation.py` for Precision/Recall and model evaluation.
+The validation CLI remains `scripts/models/validate_inputs.py`; its checks live in `datasets.py`. Each job logs its own
 model and scores; training does not execute baselines or publish active models.
 `src/models/comparison.py` reads the completed MLflow runs and makes the release decision.
 Its `compare_models()` function coordinates three steps: `load_model_results()` loads
@@ -141,26 +174,26 @@ The tree count is an upper limit. The same defaults are used by the Airflow DAG.
 | Program | Purpose |
 |---|---|
 | `validate_inputs.py` | Check feature schemas, split metadata, dates and warehouse readability |
-| `train_forecasting.py` | Train a LightGBM Poisson regressor for next-day product/state demand |
-| `train_recommendation.py` | Train a LightGBM LambdaRank model from historical customer snapshots |
+| `forecasting_lightgbm.py` | Train a LightGBM Poisson regressor for next-day product/state demand |
+| `recommendation_lightgbm.py` | Train a LightGBM LambdaRank model from historical customer snapshots |
 
-First complete `olist_end_to_end_pipeline`. Disconnect DBeaver from `olist.duckdb` before training, and avoid running warehouse preparation at the same time. Run from the repository root:
+First complete `olist_data_preparation`. Disconnect DBeaver from `olist.duckdb` before training, and avoid running warehouse preparation at the same time. Run from the repository root:
 
-The **`olist_production_training`** DAG runs six separate tasks:
+With the current model configuration, **`olist_model_training`** runs six tasks:
 
 ```text
 validate_training_inputs
   → evaluate_forecasting_baselines
   → evaluate_recommendation_baselines
-  → train_forecasting_model
-  → train_recommendation_model
+  → train_forecasting_lightgbm
+  → train_recommendation_lightgbm_ranker
   → compare_models
 ```
 
-Trigger it from the Airflow UI after `olist_end_to_end_pipeline` succeeds, or use:
+Trigger it from the Airflow UI after `olist_data_preparation` succeeds, or use:
 
 ```bash
-airflow dags trigger olist_production_training
+airflow dags trigger olist_model_training
 ```
 
 The DAG appears when Airflow loads `pipelines/`. It uses its Airflow run ID as the
@@ -173,11 +206,11 @@ and pass the same ID to every job:
 
 ```bash
 PIPELINE_RUN_ID="manual-$(date +%Y%m%d-%H%M%S)"
-.venv/bin/python scripts/models/production/validate_inputs.py
-.venv/bin/python scripts/models/baseline/forecasting_baselines.py --pipeline-run-id "$PIPELINE_RUN_ID"
-.venv/bin/python scripts/models/baseline/recommendation_baselines.py --pipeline-run-id "$PIPELINE_RUN_ID"
-.venv/bin/python scripts/models/production/train_forecasting.py --pipeline-run-id "$PIPELINE_RUN_ID"
-.venv/bin/python scripts/models/production/train_recommendation.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/validate_inputs.py
+.venv/bin/python scripts/models/forecasting/forecasting_baseline.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/recommendation/recommendation_baseline.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/forecasting/forecasting_lightgbm.py --pipeline-run-id "$PIPELINE_RUN_ID"
+.venv/bin/python scripts/models/recommendation/recommendation_lightgbm.py --pipeline-run-id "$PIPELINE_RUN_ID"
 .venv/bin/python scripts/models/comparison/compare_models.py --pipeline-run-id "$PIPELINE_RUN_ID"
 ```
 
@@ -185,6 +218,51 @@ Standalone jobs can also run without an ID for exploration; each generates a new
 ID and therefore will not automatically form a comparison group. When changing
 recommendation dates, `--top-k` or `--candidate-limit`, pass identical evaluation
 settings to both recommendation jobs.
+
+### Add another model
+
+`configs/production_models.json` is shared by the training DAG and comparison code.
+Each key under `forecasting` or `recommendation` is the model name expected in the
+MLflow `model` tag and saved result. Each entry specifies a script relative to
+`scripts/models/` and maps CLI flags to existing Airflow parameters.
+
+For example, after implementing a random-forest forecaster, add this entry under
+`forecasting` alongside `lightgbm`:
+
+```json
+"random_forest": {
+  "script": "forecasting/forecasting_random_forest.py",
+  "parameters": {
+    "max-train-rows": "max_train_rows"
+  }
+}
+```
+
+1. Add the implementation as `src/models/<task>/<task>_<algorithm>.py` and its
+   CLI wrapper as `scripts/models/<task>/<task>_<algorithm>.py`. For example,
+   use `forecasting/forecasting_model2.py` for another forecasting model. Keep familiar stage
+   names such as `prepare_data()`, `train_model()`, `evaluate_model()` and `run_pipeline()`.
+2. Reuse shared datasets and evaluation functions. Forecasting models must expose
+   `predict(feature_frame)`; recommenders must expose `predict(snapshot, customer, k)`.
+3. Log through `common.save_run()` with the matching `task`, `role="candidate"`,
+   registered model name, pipeline run ID, evaluation context, validation/test
+   scores and a loadable `model.pkl`. Forecasting results also need `prediction_varies`.
+4. Add the model to the configuration. Its wrapper must accept `--pipeline-run-id`
+   and the flags in its `parameters` mapping. For new tuning options, add the
+   corresponding Airflow `Param`; an algorithm need not accept LightGBM's flags.
+5. Let Airflow reload the DAG, then trigger a new pipeline run. The DAG creates
+   `train_<task>_<model>` automatically and comparison waits for every configured
+   model. To run manually, execute every registered job with the same pipeline ID
+   before the comparison command.
+
+A model can be registered for forecasting, recommendations or both. Adding a
+registration does not implement its trainer. Keep configuration fixed during a
+pipeline execution; newly registered models must produce matching results before
+comparison can proceed.
+
+All model implementations and CLI wrappers live in the forecasting and
+recommendation folders. There are no baseline/production model directories.
+Saved models use the current module paths and load directly with `joblib.load()`.
 
 ### Forecasting evaluation
 
@@ -198,7 +276,7 @@ settings to both recommendation jobs.
 
 ### Recommendation evaluation
 
-- Monthly March–June 2018 snapshots provide training examples; July is validation and August is test by default.
+- Monthly March–May 2018 snapshots provide training examples; June is validation, July is test and August is reserved for inference/monitoring by default.
 - A snapshot uses only purchases made and delivered before its cutoff. Training delivery outcomes must be known before validation; validation outcomes before test; test outcomes before the test-period end.
 - Candidates come from global popularity, recent customer categories and purchase history. Future purchased products are never injected into candidate lists. Repeat purchases are eligible for both ranker and baselines.
 - Training omits groups without positive/negative candidate variation because they supply no pairwise ranking signal. Evaluation retains all purchasing customers, including new customers and purchases outside the candidate/catalog pool.
@@ -216,18 +294,20 @@ Each baseline/candidate run saves three files in its own MLflow run directory:
 - `report.json`: evaluation settings, data fingerprint, run ID and parameters.
 
 Baseline artifacts are under `data/baselines/forecasting/` and
-`data/baselines/recommendations/`; candidates are under `data/production/forecasting/`
-and `data/production/recommendations/`. Historical runs remain unchanged.
+`data/baselines/recommendations/`; LightGBM candidates are under
+`data/production/lightgbm/forecasting/` and `data/production/lightgbm/recommendations/`. Historical runs remain unchanged.
 
 Only the final comparison task updates active model files. It requires all baseline
-runs and the candidate from the same pipeline run ID, with matching evaluation
+runs and every configured candidate from the same pipeline run ID, with matching evaluation
 fingerprints, settings and row/customer counts. Missing or incompatible runs fail
 the task before either model is published. Task retries use the newest completed
 run for each method within that group; failed runs and other groups are excluded.
 Comparison decisions are logged as separate MLflow runs and saved under
 `data/comparisons/<comparison-run-id>/report.json`.
 
-The strongest nonzero forecasting baseline and strongest recommendation baseline are selected using validation only. A trained model must improve validation MAE without worse RMSE (forecasting), or improve Recall@K without worse Precision@K (recommendations). Constant forecasting predictions are rejected. The same frozen candidate must also pass those metric comparisons against that baseline on test before publication. Test is a release veto, not a source for selecting hyperparameters or baseline methods.
+Validation selects the strongest nonzero forecasting baseline and strongest recommendation baseline. A candidate qualifies by improving validation MAE without worse RMSE (forecasting), or improving Recall@K without worse Precision@K (recommendations). Constant forecasting candidates are excluded. Among qualifying candidates, forecasting selects the lowest validation MAE, then RMSE; recommendations select the highest validation Recall@K, then Precision@K. Model names break remaining ties deterministically.
+
+Only the selected validation winner is checked against its baseline on test for publication. If it fails, comparison retains the current model or publishes a baseline fallback on the first deployment. It does not try other candidates based on test results. If no candidate qualifies on validation, none is approved. Test metrics never determine which candidate wins. Comparison reports include `validation_ranking`, `validation_eligible` and `candidate_run_ids` for all configured candidates.
 
 New runs log only these two performance metrics per task for validation and test. Row/customer counts stay in reports or CSVs, and approval outcomes are MLflow tags. Historical MLflow runs and existing artifacts retain the metrics recorded when they were created.
 
@@ -241,10 +321,10 @@ A rejected candidate never replaces an existing active file. On the first run, a
 To use the saved recommendation bundle:
 
 ```python
-import joblib
 import pandas as pd
-from src.models.baseline.recommendation_baselines import load_history
-from src.models.production.recommendation import RecommendationSnapshot
+import joblib
+from src.models.datasets import load_history
+from src.models.datasets import RecommendationSnapshot
 
 cutoff = pd.Timestamp("2018-08-01")
 history = load_history(warehouse_path, cutoff)  # warehouse_path is a pathlib.Path
@@ -254,6 +334,61 @@ products = model.predict(snapshot, "CUSTOMER_UNIQUE_ID", k=10)
 ```
 
 The forecasting frame must contain observed demand, historical lag/rolling columns, date, product and state. Weekly/28-day fallback rules additionally require `demand_lag_6`/`demand_lag_27`; they do not require a future target column. These scripts provide training, backtesting and local inference artifacts; live feature generation, an API deployment and live inventory eligibility are separate work.
+
+## Batch inference from the selected model
+
+Inference loads only the active bundle published by comparison:
+
+- Forecasting: `models/forecast_model.pkl`.
+- Recommendations: `models/recommender.pkl`.
+
+It calls the bundle's `predict()` interface without choosing an algorithm, scanning
+MLflow runs or importing a specific LightGBM trainer. The active bundle can contain
+a trained model or the selected baseline fallback. A rejected candidate cannot be
+used just because it is the newest training run.
+
+Comparison stores `serving_metadata` inside each newly published bundle: task,
+model name, candidate/baseline role, selected model run ID, originating training
+pipeline run ID, serving approval and recommendation K/candidate settings. Model
+and metadata are replaced atomically together. Retaining an existing active model
+also retains its original identity. Inference refuses missing bundles or bundles
+without matching serving approval.
+
+The **`olist_batch_inference`** DAG runs `predict_forecasting` then
+`predict_recommendation`. Trigger it after model comparison. Its form accepts
+`as_of`, `forecast_features`, `warehouse`, `models_dir` and `output_dir`. Default
+inputs replay August 1, 2018 from `inference.parquet`. This is a historical replay;
+for real batches, provide inputs prepared using information available at the cutoff.
+
+Monitoring defaults are also recorded in `configs/settings.yaml`: a seven-day
+window, a seven-day recommendation outcome horizon, MAE/RMSE and Precision@K/Recall@K.
+Automatic retraining is disabled. The monitoring job is not implemented yet.
+
+Equivalent manual commands:
+
+```bash
+.venv/bin/python scripts/inference/run_batch.py \
+  --task forecasting --as-of 2018-08-01 \
+  --input-path data/features/forecasting/inference.parquet
+
+.venv/bin/python scripts/inference/run_batch.py \
+  --task recommendation --as-of 2018-08-01 \
+  --input-path data/warehouse/olist.duckdb
+```
+
+Forecasting filters the input Parquet to feature date `as_of` and predicts the next
+day. It requires the selected model's input columns but does not require
+`target_demand_next_day`. Recommendations use purchases made and delivered strictly
+before `as_of` and recommend for known historical customers using the selected
+model's saved K and candidate limit. The two tasks load their own active model at
+task start; a later model replacement takes effect on a subsequent task execution.
+
+Outputs are under
+`data/predictions/<task>/as_of=<date>/model_run_id=<selected-run>/predictions.parquet`.
+They contain model identity and both training/inference pipeline IDs. Recommendation
+lists preserve rank. Retries for the same model/date replace the output atomically;
+different selected model run IDs keep separate prediction partitions.
+
 
 ## View MLflow runs in the browser
 

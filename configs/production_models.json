@@ -1,0 +1,25 @@
+{
+  "forecasting": {
+    "lightgbm": {
+      "script": "forecasting/forecasting_lightgbm.py",
+      "parameters": {
+        "max-train-rows": "max_train_rows",
+        "n-estimators": "forecast_estimators"
+      }
+    }
+  },
+  "recommendation": {
+    "lightgbm_ranker": {
+      "script": "recommendation/recommendation_lightgbm.py",
+      "parameters": {
+        "candidate-limit": "candidate_limit",
+        "top-k": "top_k",
+        "n-estimators": "ranking_estimators",
+        "training-start": "training_start",
+        "validation-cutoff": "validation_start",
+        "test-cutoff": "test_start",
+        "test-end": "monitoring_start"
+      }
+    }
+  }
+}

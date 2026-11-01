@@ -13,18 +13,22 @@ import mlflow
 import pandas as pd
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 TRACKING_URI = f"sqlite:///{ROOT / 'data/baselines/mlflow.db'}"
+MODEL_FILES = {"forecasting": "forecast_model.pkl", "recommendation": "recommender.pkl"}
 
 
-def publish_model(model, path: Path, approved: bool) -> str:
+def publish_model(model, path: Path, approved: bool, metadata=None) -> str:
     """Never replace an existing model with a rejected candidate.
 
     On a first run without an active artifact, a rejected candidate's selected
-    baseline wrapper can be published as the initial fallback.
+    baseline wrapper can be published as the initial fallback. Serving metadata
+    is stored inside the same atomically replaced bundle as the selected model.
     """
     if not approved and path.exists():
         return "retained_existing_model"
+    if metadata is not None:
+        model.serving_metadata = metadata
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as stream:
         temporary = Path(stream.name)
@@ -42,7 +46,10 @@ def evaluation_context(task, paths, **settings):
     for path in paths:
         with Path(path).open("rb") as stream:
             files[str(Path(path).resolve())] = hashlib.file_digest(stream, "sha256").hexdigest()
-    protocol = hashlib.sha256((Path(__file__).parents[1] / "evaluation.py").read_bytes()).hexdigest()
+    protocol_hash = hashlib.sha256()
+    for filename in ["datasets.py", "evaluation.py"]:
+        protocol_hash.update((Path(__file__).parent / filename).read_bytes())
+    protocol = protocol_hash.hexdigest()
     context = {"task": task, "files": files, "protocol": protocol, **settings}
     context["evaluation_id"] = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
     return context

@@ -5,10 +5,13 @@ from pathlib import Path
 from lightgbm import LGBMRanker, early_stopping
 import numpy as np
 import pandas as pd
-from src.models.baseline.recommendation_baselines import METHODS as BASELINES, predict_baseline
-from src.models.evaluation import (RecommendationSnapshot, RANK_FEATURES as NUMERIC_FEATURES,
-    load_history, load_labels as _load_labels, ranking_metrics, evaluate_recommendations)
-from src.models.production.common import ROOT, TRACKING_URI, recommendation_context, save_run
+from src.common.config import REPLAY, SETTINGS
+from src.models.recommendation.recommendation_baseline import METHODS as BASELINES, predict_baseline
+from src.models.datasets import (
+    RecommendationSnapshot, RANK_FEATURES as NUMERIC_FEATURES, load_history, load_labels as _load_labels,
+)
+from src.models.evaluation import evaluate_recommendations
+from src.models.common import ROOT, TRACKING_URI, recommendation_context, save_run
 
 class ProductionRecommender:
     """Use a validated ranker, otherwise the selected baseline retrieval rule."""
@@ -89,9 +92,10 @@ def evaluate_model(model, snapshot, labels, k):
     return evaluate_recommendations({"lightgbm_ranker": model}, snapshot, labels, k)
 
 
-def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT / "data/production/recommendations",
-        tracking_uri=TRACKING_URI, training_start="2018-03-01", validation_cutoff="2018-07-01",
-        test_cutoff="2018-08-01", test_end="2018-09-01", candidate_limit=100, top_k=10,
+def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT / "data/production/lightgbm/recommendations",
+        tracking_uri=TRACKING_URI, training_start=REPLAY["training_start"], validation_cutoff=REPLAY["validation_start"],
+        test_cutoff=REPLAY["test_start"], test_end=REPLAY["monitoring_start"], candidate_limit=SETTINGS["recommendation"]["candidate_limit"],
+        top_k=SETTINGS["recommendation"]["top_k"],
         n_estimators=100, seed=42, pipeline_run_id=None):
     start, validation_start, test_start, end = map(pd.Timestamp, [training_start, validation_cutoff, test_cutoff, test_end])
     if any(date.tzinfo is not None or pd.isna(date) for date in [start, validation_start, test_start, end]):
@@ -123,15 +127,15 @@ def run_pipeline(warehouse=ROOT / "data/warehouse/olist.duckdb", output_dir=ROOT
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--warehouse", type=Path, default=ROOT / "data/warehouse/olist.duckdb")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/recommendations")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/production/lightgbm/recommendations")
     parser.add_argument("--pipeline-run-id")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
-    parser.add_argument("--training-start", default="2018-03-01")
-    parser.add_argument("--validation-cutoff", default="2018-07-01")
-    parser.add_argument("--test-cutoff", default="2018-08-01")
-    parser.add_argument("--test-end", default="2018-09-01")
-    parser.add_argument("--candidate-limit", type=int, default=100)
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--training-start", default=REPLAY["training_start"])
+    parser.add_argument("--validation-cutoff", default=REPLAY["validation_start"])
+    parser.add_argument("--test-cutoff", default=REPLAY["test_start"])
+    parser.add_argument("--test-end", default=REPLAY["monitoring_start"])
+    parser.add_argument("--candidate-limit", type=int, default=SETTINGS["recommendation"]["candidate_limit"])
+    parser.add_argument("--top-k", type=int, default=SETTINGS["recommendation"]["top_k"])
     parser.add_argument("--n-estimators", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

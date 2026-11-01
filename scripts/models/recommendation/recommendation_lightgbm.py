@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper to run the recommendation baseline evaluation pipeline."""
+"""CLI wrapper for purchase-based ranking model training."""
 
 import sys
 from pathlib import Path
@@ -7,7 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
-from src.models.baseline.recommendation_baselines import main
+from src.models.recommendation.recommendation_lightgbm import main
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

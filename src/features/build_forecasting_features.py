@@ -5,7 +5,7 @@ fill missing dates with zero demand per product-region pair,
 create lag and past-only rolling features, 
 add calendar fields, 
 create a next-day target, 
-and write chronological train/validation/test Parquet files under data/features/forecasting.
+and write chronological train/validation/test and inference Parquet files under data/features/forecasting.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
+from src.common.config import REPLAY
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CURATED = ROOT / "data" / "curated"
@@ -27,8 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=CURATED)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT)
-    parser.add_argument("--validation-days", type=int, default=30)
-    parser.add_argument("--test-days", type=int, default=30)
+    parser.add_argument("--validation-start", default=REPLAY["validation_start"])
+    parser.add_argument("--test-start", default=REPLAY["test_start"])
+    parser.add_argument("--monitoring-start", default=REPLAY["monitoring_start"])
+    parser.add_argument("--monitoring-end", default=REPLAY["monitoring_end"])
     return parser.parse_args()
 
 
@@ -47,8 +51,9 @@ def daily_demand_query(input_dir: Path) -> str:
             SELECT MIN(purchase_date) AS min_date, MAX(purchase_date) AS max_date
             FROM daily
         ), pairs AS (
-            SELECT DISTINCT product_id, customer_state
+            SELECT product_id, customer_state, MIN(purchase_date) AS first_purchase
             FROM daily
+            GROUP BY product_id, customer_state
         ), calendar AS (
             SELECT CAST(day AS DATE) AS purchase_date
             FROM bounds,
@@ -62,6 +67,7 @@ def daily_demand_query(input_dir: Path) -> str:
             FROM calendar
             CROSS JOIN pairs
             LEFT JOIN daily USING (purchase_date, product_id, customer_state)
+            WHERE calendar.purchase_date >= pairs.first_purchase
         )
         SELECT
             purchase_date,
@@ -119,60 +125,59 @@ def build_features(input_dir: Path) -> pd.DataFrame:
         "rolling_mean_7",
         "rolling_std_7",
         "rolling_mean_28",
-        "target_demand_next_day",
     ]
     return features.dropna(subset=required_features)
 
 
-def split_features(
-    features: pd.DataFrame, validation_days: int, test_days: int
-) -> dict[str, pd.DataFrame]:
-    if validation_days <= 0 or test_days <= 0:
-        raise ValueError("validation-days and test-days must be positive")
-
-    last_date = features["purchase_date"].max()
-    test_start = last_date - pd.Timedelta(days=test_days - 1)
-    validation_start = test_start - pd.Timedelta(days=validation_days)
+def split_features(features, validation_start, test_start, monitoring_start, monitoring_end):
+    """Separate development labels from replay inputs using next-day target dates."""
+    validation_start, test_start, monitoring_start, monitoring_end = map(
+        pd.Timestamp, [validation_start, test_start, monitoring_start, monitoring_end]
+    )
+    if not validation_start < test_start < monitoring_start < monitoring_end:
+        raise ValueError("Validation, test and monitoring dates must be chronological")
+    target_date = features.purchase_date + pd.Timedelta(days=1)
+    labeled = features.target_demand_next_day.notna()
     return {
-        "train": features.loc[features["purchase_date"] < validation_start].copy(),
-        "validation": features.loc[
-            (features["purchase_date"] >= validation_start)
-            & (features["purchase_date"] < test_start)
-        ].copy(),
-        "test": features.loc[features["purchase_date"] >= test_start].copy(),
+        "train": features.loc[labeled & target_date.lt(validation_start)].copy(),
+        "validation": features.loc[labeled & target_date.ge(validation_start) & target_date.lt(test_start)].copy(),
+        "test": features.loc[labeled & target_date.ge(test_start) & target_date.lt(monitoring_start)].copy(),
+        # Inference needs features even when tomorrow's demand is not yet known.
+        "inference": features.loc[
+            features.purchase_date.ge(monitoring_start) & features.purchase_date.lt(monitoring_end)
+        ].drop(columns="target_demand_next_day").copy(),
     }
 
 
-def write_outputs(
-    splits: dict[str, pd.DataFrame], output_dir: Path, validation_days: int, test_days: int
-) -> dict:
+def write_outputs(splits, output_dir, **boundaries):
     output_dir.mkdir(parents=True, exist_ok=True)
     for name, frame in splits.items():
+        if frame.empty:
+            raise ValueError(f"No {name} rows for the configured replay dates")
         frame.to_parquet(output_dir / f"{name}.parquet", index=False)
 
     metadata = {
-        "validation_days": validation_days,
-        "test_days": test_days,
+        "boundaries": boundaries,
         "rows": {name: len(frame) for name, frame in splits.items()},
         "date_ranges": {
             name: {
-                "min": frame["purchase_date"].min().strftime("%Y-%m-%d"),
-                "max": frame["purchase_date"].max().strftime("%Y-%m-%d"),
+                "min": frame.purchase_date.min().strftime("%Y-%m-%d"),
+                "max": frame.purchase_date.max().strftime("%Y-%m-%d"),
             }
             for name, frame in splits.items()
         },
     }
-    (output_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
     return metadata
 
 
 def main() -> int:
     args = parse_args()
     features = build_features(args.input_dir)
-    splits = split_features(features, args.validation_days, args.test_days)
-    metadata = write_outputs(splits, args.output_dir, args.validation_days, args.test_days)
+    boundaries = {name: getattr(args, name) for name in
+                  ["validation_start", "test_start", "monitoring_start", "monitoring_end"]}
+    splits = split_features(features, **boundaries)
+    metadata = write_outputs(splits, args.output_dir, **boundaries)
     print(json.dumps(metadata, indent=2))
     return 0
 

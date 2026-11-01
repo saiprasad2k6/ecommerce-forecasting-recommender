@@ -35,10 +35,9 @@ with tempfile.TemporaryDirectory() as directory:
     from airflow.dag_processing.dagbag import DagBag
     bag = DagBag(dag_folder=str(root / 'pipelines/data_pipeline.py'))
     assert not bag.import_errors, bag.import_errors
-    dag = bag.dags['olist_end_to_end_pipeline']
+    dag = bag.dags['olist_data_preparation']
     expected = ['download_olist_data', 'validate_olist_data', 'clean_olist_data',
-        'prepare_curated_data', 'build_forecasting_features', 'build_recommendation_features',
-        'run_forecasting_baselines', 'run_recommendation_baselines']
+        'prepare_curated_data', 'build_forecasting_features', 'build_recommendation_features']
     assert [task.task_id for task in dag.topological_sort()] == expected
     assert dag.max_active_runs == 1 and dag.max_active_tasks == 1
     assert dag.schedule is None and not dag.catchup
@@ -52,16 +51,16 @@ with tempfile.TemporaryDirectory() as directory:
 
     # Invalid periods must be rejected before a pipeline run is accepted.
     try:
-        dag.params.get_param('test_days').resolve(0)
+        dag.params.get_param('test_start').resolve('invalid-date')
     except Exception as error:
         assert type(error).__name__ == 'ParamValidationError', type(error)
     else:
-        raise AssertionError('Nonpositive test_days accepted')
+        raise AssertionError('Invalid test_start accepted')
 
     params = dag.params.validate()
     marker = temporary / 'must_not_be_created'
     customer = 'customer"; touch "' + str(marker) + '"; echo "'
-    params.update(validation_days=14, test_days=7, top_k=3,
+    params.update(validation_start='2018-06-01', test_start='2018-07-01', top_k=3,
                   recommendation_customer_id=customer)
     records = {}
     for task in dag.topological_sort():
@@ -75,21 +74,19 @@ with tempfile.TemporaryDirectory() as directory:
         records[task.task_id] = args
     assert not marker.exists(), 'Customer parameter was interpreted as shell code'
     feature_args = records['build_forecasting_features']
-    assert feature_args[feature_args.index('--validation-days') + 1] == '14'
-    assert feature_args[feature_args.index('--test-days') + 1] == '7'
+    assert feature_args[feature_args.index('--validation-start') + 1] == '2018-06-01'
+    assert feature_args[feature_args.index('--test-start') + 1] == '2018-07-01'
+    assert feature_args[feature_args.index('--monitoring-start') + 1] == '2018-08-01'
     rec_args = records['build_recommendation_features']
     assert rec_args[rec_args.index('--customer-id') + 1] == customer
-    for task_id in ['build_recommendation_features', 'run_recommendation_baselines']:
-        args = records[task_id]
-        assert args[args.index('--top-k') + 1] == '3'
-    for task_id in ['run_forecasting_baselines', 'run_recommendation_baselines']:
-        args = records[task_id]
-        assert args[args.index('--tracking-uri') + 1] == f'sqlite:///{root / "data/baselines/mlflow.db"}'
+    assert rec_args[rec_args.index('--top-k') + 1] == '3'
     training_bag = DagBag(dag_folder=str(root / 'pipelines/training_pipeline.py'))
     assert not training_bag.import_errors, training_bag.import_errors
-    training = training_bag.dags['olist_production_training']
-    training_order = ['validate_training_inputs', 'evaluate_forecasting_baselines',
-        'evaluate_recommendation_baselines', 'train_forecasting_model', 'train_recommendation_model', 'compare_models']
+    training = training_bag.dags['olist_model_training']
+    model_jobs = json.loads((root / 'configs/production_models.json').read_text())
+    training_order = ['validate_training_inputs', 'evaluate_forecasting_baselines', 'evaluate_recommendation_baselines']
+    training_order += [f'train_{task}_{model}' for task, models in model_jobs.items() for model in models]
+    training_order += ['compare_models']
     assert [task.task_id for task in training.topological_sort()] == training_order
     assert training.max_active_runs == 1 and training.max_active_tasks == 1
     assert training.schedule is None
@@ -105,9 +102,47 @@ with tempfile.TemporaryDirectory() as directory:
         assert Path(args[0]).is_file()
         if task.task_id != 'validate_training_inputs':
             assert args[args.index('--pipeline-run-id') + 1] == 'manual__example'
-        if task.task_id == 'train_forecasting_model':
+        if task.task_id in ['evaluate_recommendation_baselines', 'train_recommendation_lightgbm_ranker']:
+            assert args[args.index('--validation-cutoff') + 1] == '2018-06-01'
+            assert args[args.index('--test-cutoff') + 1] == '2018-07-01'
+            assert args[args.index('--test-end') + 1] == '2018-08-01'
+        if task.task_id == 'train_forecasting_lightgbm':
             assert args[args.index('--max-train-rows') + 1] == '1000'
-    print('Both DAGs, dependencies, parameter validation and shell commands verified')
+    expanded_root = temporary / 'project with more models'
+    (expanded_root / 'configs').mkdir(parents=True)
+    model_jobs['forecasting']['another_model'] = {
+        'script': 'forecasting/forecasting_another_model.py', 'parameters': {'max-train-rows': 'max_train_rows'},
+    }
+    (expanded_root / 'configs/production_models.json').write_text(json.dumps(model_jobs))
+    (expanded_root / 'configs/settings.yaml').write_text((root / 'configs/settings.yaml').read_text())
+    os.environ['OLIST_PROJECT_ROOT'] = str(expanded_root)
+    expanded_bag = DagBag(dag_folder=str(root / 'pipelines/training_pipeline.py'))
+    assert not expanded_bag.import_errors, expanded_bag.import_errors
+    expanded = expanded_bag.dags['olist_model_training']
+    expanded_order = [task.task_id for task in expanded.topological_sort()]
+    assert 'train_forecasting_another_model' in expanded_order
+    assert expanded_order.index('train_forecasting_another_model') < expanded_order.index('compare_models')
+    assert expanded.get_task('compare_models').upstream_task_ids == {expanded_order[-2]}
+    os.environ['OLIST_PROJECT_ROOT'] = str(root)
+    inference_bag = DagBag(dag_folder=str(root / 'pipelines/batch_inference.py'))
+    assert not inference_bag.import_errors, inference_bag.import_errors
+    inference = inference_bag.dags['olist_batch_inference']
+    assert [task.task_id for task in inference.topological_sort()] == ['predict_forecasting', 'predict_recommendation']
+    assert inference.max_active_tasks == 1 and inference.schedule is None
+    for task in inference.topological_sort():
+        task.render_template_fields({'params': inference.params.validate(), 'run_id': 'inference__example'})
+        record_file = temporary / (task.task_id + '.json')
+        subprocess.run(['bash', '-c', task.bash_command], cwd=task.cwd,
+            env={**os.environ, **task.env, 'TEST_RECORD_FILE': str(record_file)},
+            check=True, capture_output=True, text=True)
+        args = json.loads(record_file.read_text())
+        assert Path(args[0]).is_file()
+        assert args[args.index('--pipeline-run-id') + 1] == 'inference__example'
+        assert args[args.index('--models-dir') + 1] == 'models'
+        assert args[args.index('--as-of') + 1] == '2018-08-01'
+        if task.task_id == 'predict_forecasting':
+            assert args[args.index('--input-path') + 1] == 'data/features/forecasting/inference.parquet'
+    print('Data, training and inference DAGs, model registration and shell commands verified')
 '''
         result = subprocess.run([sys.executable, "-c", check], cwd=root,
                                 capture_output=True, text=True, timeout=60)

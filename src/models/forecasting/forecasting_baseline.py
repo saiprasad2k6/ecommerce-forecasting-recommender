@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 from src.models.evaluation import evaluate_forecasting
-from src.models.production.common import ROOT, TRACKING_URI, forecast_context, save_run
+from src.models.common import ROOT, TRACKING_URI, forecast_context, save_run
 
 METHODS = ["last_day", "same_day_last_week", "moving_average_7", "moving_average_28", "seasonal_naive_28", "always_zero"]
 
@@ -45,7 +45,7 @@ class BaselineForecaster:
 
 def evaluate_baselines_duckdb(parquet_path, split_name):
     metadata = json.loads((parquet_path.parent / "metadata.json").read_text())
-    boundary = pd.Timestamp(metadata["date_ranges"]["test"]["min"]) if split_name == "validation" else None
+    boundary = pd.Timestamp(metadata["boundaries"]["test_start"]) if split_name == "validation" else None
     metrics, _ = evaluate_forecasting({name: BaselineForecaster(name) for name in METHODS},
                                      parquet_path.parent, split_name, boundary)
     return pd.DataFrame.from_dict(metrics, orient="index").rename_axis("baseline").reset_index().assign(split=split_name).sort_values("mae")
@@ -57,7 +57,7 @@ def run_baseline_pipeline(features_dir=ROOT / "data/features/forecasting",
     pipeline_run_id = pipeline_run_id or uuid4().hex
     context = forecast_context(features_dir)
     metadata = json.loads((features_dir / "metadata.json").read_text())
-    boundary = pd.Timestamp(metadata["date_ranges"]["test"]["min"])
+    boundary = pd.Timestamp(metadata["boundaries"]["test_start"])
     models = {name: BaselineForecaster(name) for name in METHODS}
     validation, _ = evaluate_forecasting(models, features_dir, "validation", boundary)
     test, _ = evaluate_forecasting(models, features_dir, "test")

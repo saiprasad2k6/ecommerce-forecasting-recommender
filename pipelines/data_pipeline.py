@@ -1,8 +1,8 @@
-"""Airflow 3 DAG: download Olist, prepare features and evaluate baselines.
+"""Airflow 3 DAG: download Olist and prepare data and features.
 
 The project checkout and Python environment must be available to every worker.
 Override OLIST_PROJECT_ROOT / OLIST_PYTHON when deploying outside this checkout.
-No dataset access or model evaluation happens when the scheduler parses this file.
+No dataset access or feature preparation happens when the scheduler parses this file.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -11,11 +11,15 @@ from pathlib import Path
 import shlex
 import sys
 
+import yaml
+
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import DAG, Param
 
 
 ROOT = Path(os.environ.get("OLIST_PROJECT_ROOT", Path(__file__).resolve().parents[1])).resolve()
+SETTINGS = yaml.safe_load((ROOT / "configs/settings.yaml").read_text())
+REPLAY = SETTINGS["replay"]
 PROJECT_PYTHON = ROOT / ".venv" / "bin" / "python"
 PYTHON = os.environ.get("OLIST_PYTHON", str(PROJECT_PYTHON) if PROJECT_PYTHON.is_file() else sys.executable)
 RAW = ROOT / "data/raw"
@@ -23,8 +27,6 @@ PROCESSED = ROOT / "data/processed"
 CURATED = ROOT / "data/curated"
 WAREHOUSE = ROOT / "data/warehouse/olist.duckdb"
 FEATURES = ROOT / "data/features"
-BASELINES = ROOT / "data/baselines"
-TRACKING_URI = f"sqlite:///{BASELINES / 'mlflow.db'}"
 
 
 def script_task(task_id: str, script: str, *arguments: str, env: dict | None = None) -> BashOperator:
@@ -49,8 +51,8 @@ def script_task(task_id: str, script: str, *arguments: str, env: dict | None = N
 
 
 with DAG(
-    dag_id="olist_end_to_end_pipeline",
-    description="Download, validate, clean, curate, build features and evaluate Olist baselines",
+    dag_id="olist_data_preparation",
+    description="Download, validate, clean and curate Olist data, then build features",
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     schedule=None,
     catchup=False,
@@ -59,28 +61,28 @@ with DAG(
     default_args={"owner": "ecommerce", "retries": 1,
                   "retry_delay": timedelta(minutes=5),
                   "execution_timeout": timedelta(hours=6)},
-    tags=["olist", "features", "baselines"],
+    tags=["olist", "data-preparation", "features"],
     params={
-        "validation_days": Param(30, type="integer", minimum=1),
-        "test_days": Param(30, type="integer", minimum=1),
+        **{name: Param(REPLAY[name], type="string", format="date") for name in
+           ["validation_start", "test_start", "monitoring_start", "monitoring_end"]},
         "recommendation_customer_id": Param("new-customer", type="string", minLength=1,
             description="customer_unique_id; the default exercises the new-customer popularity fallback"),
         "recommendation_state": Param("SP", type="string", pattern="^[A-Z]{2}$"),
-        "recommendation_as_of": Param("2018-08-01", type="string", format="date",
+        "recommendation_as_of": Param(REPLAY["monitoring_start"], type="string", format="date",
             description="Historical recommendation feature cutoff, within the Olist data period"),
-        "top_k": Param(10, type="integer", minimum=1),
+        "top_k": Param(SETTINGS["recommendation"]["top_k"], type="integer", minimum=1),
     },
     doc_md="""
-    ## Olist end-to-end pipeline
+    ## Olist data preparation
     Trigger manually after configuring Kaggle credentials on the worker. Existing
     complete raw downloads are reused. No task deletes or resets repository data.
 
-    Validation and cleaning must succeed before warehouse creation. Both feature
-    builders run before either baseline evaluation. Recommendation features are a
-    single-customer snapshot configured in Params; recommendation baseline evaluation
-    builds its own historical customer cohorts from the warehouse (July/August 2018).
+    Validation and cleaning must succeed before warehouse creation. Recommendation
+    features are a single-customer snapshot configured in Params. After this DAG
+    succeeds, trigger olist_model_training to evaluate baselines, train candidates
+    and publish the selected models.
 
-    All tasks use shared local paths and execute serially, including MLflow writers.
+    All tasks use shared local paths and execute serially.
     Workers need the same project checkout/storage and installed dependencies.
     """,
 ) as dag:
@@ -100,10 +102,12 @@ with DAG(
         "build_forecasting_features", "features/build_forecasting_features.py",
         "--input-dir", shlex.quote(str(CURATED)),
         "--output-dir", shlex.quote(str(FEATURES / "forecasting")),
-        "--validation-days", '"$OLIST_VALIDATION_DAYS"',
-        "--test-days", '"$OLIST_TEST_DAYS"',
-        env={"OLIST_VALIDATION_DAYS": "{{ params.validation_days }}",
-             "OLIST_TEST_DAYS": "{{ params.test_days }}"},
+        "--validation-start", '"$VALIDATION_START"',
+        "--test-start", '"$TEST_START"',
+        "--monitoring-start", '"$MONITORING_START"',
+        "--monitoring-end", '"$MONITORING_END"',
+        env={name.upper(): "{{ params." + name + " }}" for name in
+             ["validation_start", "test_start", "monitoring_start", "monitoring_end"]},
     )
     recommendation_features = script_task(
         "build_recommendation_features", "features/build_recommendation_features.py",
@@ -117,22 +121,5 @@ with DAG(
              "OLIST_AS_OF": "{{ params.recommendation_as_of }}",
              "OLIST_TOP_K": "{{ params.top_k }}"},
     )
-    forecasting_baselines = script_task(
-        "run_forecasting_baselines", "models/baseline/forecasting_baselines.py",
-        "--features-dir", shlex.quote(str(FEATURES / "forecasting")),
-        "--output-dir", shlex.quote(str(BASELINES / "forecasting")),
-        "--tracking-uri", shlex.quote(TRACKING_URI),
-        "--experiment-name", "ecommerce-demand-forecasting",
-    )
-    recommendation_baselines = script_task(
-        "run_recommendation_baselines", "models/baseline/recommendation_baselines.py",
-        "--warehouse", shlex.quote(str(WAREHOUSE)),
-        "--output-dir", shlex.quote(str(BASELINES / "recommendations")),
-        "--tracking-uri", shlex.quote(TRACKING_URI),
-        "--experiment-name", "ecommerce-recommendations",
-        "--top-k", '"$OLIST_TOP_K"',
-        env={"OLIST_TOP_K": "{{ params.top_k }}"},
-    )
-
     (download >> validate >> clean >> curate >> forecasting_features
-     >> recommendation_features >> forecasting_baselines >> recommendation_baselines)
+     >> recommendation_features)

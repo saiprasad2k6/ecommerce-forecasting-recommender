@@ -1,19 +1,25 @@
-"""Manual production-candidate training DAG; run data_pipeline.py first."""
+"""Manual model training DAG; run olist_data_preparation first."""
 
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import shlex
 import sys
+
+import yaml
 
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import DAG, Param
 
 
 ROOT = Path(os.environ.get("OLIST_PROJECT_ROOT", Path(__file__).resolve().parents[1])).resolve()
+SETTINGS = yaml.safe_load((ROOT / "configs/settings.yaml").read_text())
+REPLAY = SETTINGS["replay"]
 PROJECT_PYTHON = ROOT / ".venv/bin/python"
 DEFAULT_PYTHON = str(PROJECT_PYTHON) if PROJECT_PYTHON.is_file() else sys.executable
 PYTHON = os.environ.get("OLIST_PYTHON", DEFAULT_PYTHON)
+MODEL_JOBS = json.loads((ROOT / "configs/production_models.json").read_text())
 
 
 def training_task(task_id, script, arguments, env):
@@ -33,7 +39,7 @@ def training_task(task_id, script, arguments, env):
 
 
 with DAG(
-    dag_id="olist_production_training",
+    dag_id="olist_model_training",
     description="Validate inputs, evaluate baselines, train candidates, then compare matching MLflow runs",
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     schedule=None,
@@ -46,17 +52,21 @@ with DAG(
         "retry_delay": timedelta(minutes=5),
         "execution_timeout": timedelta(hours=6),
     },
-    tags=["olist", "production", "training"],
+    tags=["olist", "models", "training"],
     params={
+        **{name: Param(REPLAY[name], type="string", format="date") for name in
+           ["training_start", "validation_start", "test_start", "monitoring_start"]},
         "max_train_rows": Param(1_000_000, type="integer", minimum=2),
         "forecast_estimators": Param(100, type="integer", minimum=1),
         "ranking_estimators": Param(100, type="integer", minimum=1),
-        "candidate_limit": Param(100, type="integer", minimum=10),
-        "top_k": Param(10, type="integer", minimum=1),
+        "candidate_limit": Param(SETTINGS["recommendation"]["candidate_limit"], type="integer", minimum=10),
+        "top_k": Param(SETTINGS["recommendation"]["top_k"], type="integer", minimum=1),
     },
     doc_md="""
-    Run `olist_end_to_end_pipeline` successfully before triggering this DAG.
+    Run `olist_data_preparation` successfully before triggering this DAG.
     Baseline jobs and candidate jobs log separate MLflow runs sharing this DAG run ID.
+    Model jobs are registered in configs/production_models.json. Validation ranks
+    all configured candidates; test only checks the chosen validation winner.
     The final comparison task verifies evaluation fingerprints and publishes approved
     candidates, or an initial baseline fallback. Tasks run serially for SQLite/DuckDB.
     This DAG writes local artifacts; it does not
@@ -65,12 +75,13 @@ with DAG(
     Failed candidates keep the existing model/baseline fallback.
     Check each versioned report's `approved` and `publication` fields: a successful
     DAG run does not imply that both trained candidates passed their gates.
-    Recommendation defaults use March–June 2018 training, July validation and August test.
+    Recommendation defaults use March–May 2018 training, June validation and July test.
+    August is reserved for inference and monitoring.
     """,
 ) as dag:
     validate_inputs = training_task(
         "validate_training_inputs",
-        "production/validate_inputs.py",
+        "validate_inputs.py",
         '--candidate-limit "$CANDIDATES" --top-k "$TOP_K"',
         env={
             "CANDIDATES": "{{ params.candidate_limit }}",
@@ -78,35 +89,33 @@ with DAG(
         },
     )
     forecast_baselines = training_task(
-        "evaluate_forecasting_baselines", "baseline/forecasting_baselines.py",
+        "evaluate_forecasting_baselines", "forecasting/forecasting_baseline.py",
         '--pipeline-run-id "$PIPELINE_RUN_ID"', env={},
     )
     recommendation_baselines = training_task(
-        "evaluate_recommendation_baselines", "baseline/recommendation_baselines.py",
-        '--pipeline-run-id "$PIPELINE_RUN_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K"',
-        env={"CANDIDATES": "{{ params.candidate_limit }}", "TOP_K": "{{ params.top_k }}"},
+        "evaluate_recommendation_baselines", "recommendation/recommendation_baseline.py",
+        '--pipeline-run-id "$PIPELINE_RUN_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K"'
+        ' --validation-cutoff "$VALIDATION_START" --test-cutoff "$TEST_START" --test-end "$MONITORING_START"',
+        env={"CANDIDATES": "{{ params.candidate_limit }}", "TOP_K": "{{ params.top_k }}",
+             **{name.upper(): "{{ params." + name + " }}" for name in
+                ["validation_start", "test_start", "monitoring_start"]}},
     )
-    forecasting = training_task(
-        "train_forecasting_model",
-        "production/train_forecasting.py",
-        '--pipeline-run-id "$PIPELINE_RUN_ID" --max-train-rows "$TRAIN_ROWS" --n-estimators "$ESTIMATORS"',
-        env={
-            "TRAIN_ROWS": "{{ params.max_train_rows }}",
-            "ESTIMATORS": "{{ params.forecast_estimators }}",
-        },
-    )
-    recommendation = training_task(
-        "train_recommendation_model",
-        "production/train_recommendation.py",
-        '--pipeline-run-id "$PIPELINE_RUN_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K" --n-estimators "$ESTIMATORS"',
-        env={
-            "CANDIDATES": "{{ params.candidate_limit }}",
-            "TOP_K": "{{ params.top_k }}",
-            "ESTIMATORS": "{{ params.ranking_estimators }}",
-        },
-    )
+    previous = recommendation_baselines
+    for task, models in MODEL_JOBS.items():
+        for model_name, job in models.items():
+            arguments = '--pipeline-run-id "$PIPELINE_RUN_ID"'
+            env = {}
+            for flag, parameter in job["parameters"].items():
+                env[parameter.upper()] = "{{ params." + parameter + " }}"
+                arguments += f' --{flag} "${parameter.upper()}"'
+            training = training_task(
+                f"train_{task}_{model_name}", job["script"], arguments, env,
+            )
+            previous >> training
+            previous = training
     comparison = training_task(
         "compare_models", "comparison/compare_models.py",
         '--pipeline-run-id "$PIPELINE_RUN_ID"', env={},
     )
-    validate_inputs >> forecast_baselines >> recommendation_baselines >> forecasting >> recommendation >> comparison
+    validate_inputs >> forecast_baselines >> recommendation_baselines
+    previous >> comparison
