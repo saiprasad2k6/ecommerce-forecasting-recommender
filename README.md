@@ -418,6 +418,9 @@ Click a run to inspect its parameters, validation/test metrics, tags and saved C
 
 Keep the terminal running while using the UI; press **Ctrl+C** to stop the MLflow server. Airflow remains available separately at [http://localhost:8080](http://localhost:8080). If port 5001 is already occupied, choose another port and use that port in the browser URL.
 
+Pipeline logging restores a soft-deleted experiment when its configured name is reused.
+To clear all local experiment history for a fresh run, use the repository reset command below.
+
 If the experiment list is empty, confirm that baseline evaluation has finished and that the server was started from the repository root with `data/baselines/mlflow.db` as its backend store. Starting MLflow against another database will show different runs.
 
 ## Reset local pipeline outputs

@@ -11,7 +11,7 @@ import pandas as pd
 
 from src.models.forecasting.forecasting_baseline import METHODS as FORECAST_BASELINES
 from src.models.recommendation.recommendation_baseline import METHODS as REC_BASELINES
-from src.models.common import ROOT, TRACKING_URI, MODEL_FILES, publish_model
+from src.models.common import ROOT, TRACKING_URI, MODEL_FILES, publish_model, set_experiment
 
 MODEL_JOBS = json.loads((ROOT / "configs/production_models.json").read_text())
 
@@ -124,7 +124,7 @@ def compare_model_results(task, model_results):
 
 def save_comparison(decision, model, output_dir):
     """Log the decision, publish the selected model, and save the final report."""
-    mlflow.set_experiment(TASKS[decision["task"]]["experiment"])
+    set_experiment(TASKS[decision["task"]]["experiment"])
     with mlflow.start_run(run_name="comparison") as run:
         mlflow.set_tags({
             "role": "comparison", "task": decision["task"], "pipeline_run_id": decision["pipeline_run_id"],

@@ -226,6 +226,32 @@ class ProductionModelTests(unittest.TestCase):
                         forecasting.run_pipeline(root / "features", root / "outputs", tracking, max_train_rows=100, n_estimators=5)
             self.assertFalse((root / "model.pkl").exists())
 
+    def test_logging_restores_a_deleted_experiment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with isolated_tracking(root) as tracking:
+                common.mlflow.set_tracking_uri(tracking)
+                name = "ecommerce-demand-forecasting"
+                common.set_experiment(name)
+                experiment = common.mlflow.get_experiment_by_name(name)
+                common.mlflow.delete_experiment(experiment.experiment_id)
+                report = common.save_run(
+                    {"model": "test"},
+                    {"task": "forecasting", "role": "baseline", "model": "last_day",
+                     "validation": {"mae": 0.0, "rmse": 0.0, "rows": 1},
+                     "test": {"mae": 0.0, "rmse": 0.0, "rows": 1},
+                     "evaluation_context": {"evaluation_id": "sample"}},
+                    {}, root / "outputs", tracking, name, "pipeline",
+                )
+                # Reusing an active experiment keeps the same identity, too.
+                common.set_experiment(name)
+                restored = common.mlflow.get_experiment_by_name(name)
+                self.assertEqual(restored.experiment_id, experiment.experiment_id)
+                self.assertEqual(restored.lifecycle_stage, "active")
+                run = common.mlflow.MlflowClient().get_run(report["mlflow_run_id"])
+                self.assertEqual(run.info.experiment_id, restored.experiment_id)
+                self.assertEqual(run.info.status, "FINISHED")
+
     def test_baseline_pipelines_log_only_basic_metrics(self):
         from src.models.forecasting.forecasting_baseline import run_pipeline as run_forecasting_baselines
         from src.models.recommendation.recommendation_baseline import run_pipeline as run_recommendation_baselines

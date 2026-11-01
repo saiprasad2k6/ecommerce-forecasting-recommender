@@ -67,11 +67,19 @@ def recommendation_context(warehouse, validation_cutoff, test_cutoff, test_end, 
         candidate_limit=candidate_limit, k=k)
 
 
+def set_experiment(name):
+    """Restore a deleted experiment before selecting it for pipeline logging."""
+    experiment = mlflow.get_experiment_by_name(name)
+    if experiment is not None and experiment.lifecycle_stage == "deleted":
+        mlflow.restore_experiment(experiment.experiment_id)
+    mlflow.set_experiment(name)
+
+
 def save_run(model, report, params, output_dir, tracking_uri, experiment, pipeline_run_id=None):
     """Log one independently evaluated model. Publication belongs to comparison."""
     (ROOT / "data/baselines").mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(experiment)
+    set_experiment(experiment)
     with mlflow.start_run(run_name=report["role"] + "__" + report["model"]) as run:
         output = Path(output_dir) / run.info.run_id
         output.mkdir(parents=True)
