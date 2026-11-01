@@ -6,11 +6,11 @@ from uuid import uuid4
 import pandas as pd
 from src.common.config import REPLAY, SETTINGS
 from src.models.datasets import RecommendationSnapshot, load_history, load_labels
-from src.models.evaluation import ranking_metrics, evaluate_recommendations
+from src.models.evaluation import evaluate_recommendations
 from src.models.common import ROOT, TRACKING_URI, recommendation_context, save_run
 
 METHODS = ["global_popularity", "category_popularity", "purchase_history"]
-RECENT_DAYS = 90
+
 
 def predict_baseline(snapshot, method, customer, k=10):
     """Predict from historical popularity, category preference or purchase history."""
@@ -25,13 +25,6 @@ def predict_baseline(snapshot, method, customer, k=10):
     else:
         raise ValueError(method)
     return pd.Index(selected).drop_duplicates()[:k].tolist()
-def unique_top(products, k):
-    return list(dict.fromkeys(products))[:k]
-
-
-def prepare_recommender(history, cutoff):
-    snapshot = RecommendationSnapshot(history, cutoff)
-    return lambda customer, method, k: predict_baseline(snapshot, method, customer, k)
 
 
 class BaselineRecommender:
@@ -43,10 +36,8 @@ class BaselineRecommender:
     def predict(self, snapshot, customer, k=10):
         return predict_baseline(snapshot, self.method, customer, k)
 
-    recommend = predict
 
-
-def run_recommendation_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duckdb",
+def run_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duckdb",
         output_dir=ROOT / "data/baselines/recommendations", tracking_uri=TRACKING_URI,
         experiment_name="ecommerce-recommendations", k=SETTINGS["recommendation"]["top_k"],
         candidate_limit=SETTINGS["recommendation"]["candidate_limit"],
@@ -62,19 +53,22 @@ def run_recommendation_pipeline(warehouse_path=ROOT / "data/warehouse/olist.duck
     scores = {}
     for split, start, stop in [("validation", validation_start, test_start), ("test", test_start, end)]:
         snapshot = RecommendationSnapshot(load_history(warehouse_path, start), start, candidate_limit)
-        labels = load_labels(warehouse_path, start, stop, stop)
+        labels = load_labels(warehouse_path, start, stop)
         scores[split] = evaluate_recommendations(models, snapshot, labels, k)
     if context != recommendation_context(warehouse_path, validation_start, test_start, end, candidate_limit, k):
         raise ValueError("Evaluation data changed during baseline evaluation")
-    runs = [save_run(model, {"task": "recommendation", "role": "baseline", "model": name,
-                 "validation": scores["validation"][name], "test": scores["test"][name], "evaluation_context": context},
-                 {"k": k, "candidate_limit": candidate_limit}, output_dir, tracking_uri, experiment_name, pipeline_run_id)
-            for name, model in models.items()]
-    champion = min(METHODS, key=lambda name: (-scores["validation"][name]["recall_at_k"], -scores["validation"][name]["precision_at_k"], name))
-    return {"pipeline_run_id": pipeline_run_id, "champion_baseline": champion, "runs": runs}
-
-
-run_pipeline = run_recommendation_pipeline
+    runs = []
+    for name, model in models.items():
+        report = {
+            "task": "recommendation", "role": "baseline", "model": name,
+            "validation": scores["validation"][name], "test": scores["test"][name],
+            "evaluation_context": context,
+        }
+        runs.append(save_run(
+            model, report, {"k": k, "candidate_limit": candidate_limit},
+            output_dir, tracking_uri, experiment_name, pipeline_run_id,
+        ))
+    return {"pipeline_run_id": pipeline_run_id, "runs": runs}
 
 
 def main():

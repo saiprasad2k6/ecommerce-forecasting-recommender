@@ -227,7 +227,7 @@ class ProductionModelTests(unittest.TestCase):
 
     def test_baseline_pipelines_log_only_basic_metrics(self):
         from src.models.forecasting.forecasting_baseline import run_baseline_pipeline
-        from src.models.recommendation.recommendation_baseline import run_recommendation_pipeline
+        from src.models.recommendation.recommendation_baseline import run_pipeline as run_recommendation_baselines
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -235,7 +235,7 @@ class ProductionModelTests(unittest.TestCase):
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
                 forecasting = run_baseline_pipeline(root / "features", root / "forecast", tracking)
-                recommendations = run_recommendation_pipeline(
+                recommendations = run_recommendation_baselines(
                     root / "olist.duckdb", root / "recommendations", tracking, k=3
                 )
             client = common.mlflow.MlflowClient(tracking_uri=tracking)

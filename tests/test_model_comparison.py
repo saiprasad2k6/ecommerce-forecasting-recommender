@@ -15,7 +15,7 @@ from test_production_models import isolated_tracking, forecast_fixture, warehous
 from src.models.forecasting import forecasting_lightgbm as forecasting
 from src.models.recommendation import recommendation_lightgbm as recommendation
 from src.models.forecasting.forecasting_baseline import run_baseline_pipeline
-from src.models.recommendation.recommendation_baseline import run_recommendation_pipeline
+from src.models.recommendation.recommendation_baseline import run_pipeline as run_recommendation_baselines
 
 
 class ComparisonTests(unittest.TestCase):
@@ -144,7 +144,7 @@ class ComparisonTests(unittest.TestCase):
             warehouse_fixture(root / "olist.duckdb")
             with isolated_tracking(root) as tracking:
                 run_baseline_pipeline(root / "features", root / "forecast_baselines", tracking, pipeline_run_id="sample")
-                run_recommendation_pipeline(root / "olist.duckdb", root / "rec_baselines", tracking,
+                run_recommendation_baselines(root / "olist.duckdb", root / "rec_baselines", tracking,
                                            k=3, candidate_limit=5, pipeline_run_id="sample")
                 forecast = forecasting.run_pipeline(root / "features", root / "forecast", tracking,
                     max_train_rows=100, n_estimators=5, pipeline_run_id="sample")
