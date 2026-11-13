@@ -1,9 +1,15 @@
 app:
   name: ecommerce-forecasting-recommender
 data:
+  dataset: olistbr/brazilian-ecommerce
   raw_dir: data/raw
   processed_dir: data/processed
   reference_dir: data/reference
+  curated_dir: data/curated
+  warehouse: data/warehouse/olist.duckdb
+  forecasting_features: data/features/forecasting
+  recommendation_features: data/features/recommendations
+  validation_report: data/validation/raw.json
 models:
   forecast_model_path: models/forecast_model.pkl
   recommender_model_path: models/recommender.pkl
@@ -31,3 +37,20 @@ monitoring:
   recommendation_metrics: [precision_at_k, recall_at_k]
   automatic_retraining: false
   output_dir: data/monitoring
+
+training:
+  max_train_rows: 1000000
+  forecast_estimators: 100
+  ranking_estimators: 100
+  seed: 42
+
+versioning:
+  metadata_dir: snapshots
+  runs_dir: data/runs
+  remote: rustfs
+  backup_dir: backups/mlflow
+tracking:
+  uri: sqlite:///data/baselines/mlflow.db
+
+release:
+  require_clean_git: true

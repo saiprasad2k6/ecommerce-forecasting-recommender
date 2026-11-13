@@ -11,9 +11,11 @@ import pandas as pd
 import pandera.pandas as pa
 
 
+from src.common.config import SETTINGS
+
 ROOT = Path(__file__).resolve().parents[2]
-RAW = ROOT / "data" / "raw"
-PROCESSED = ROOT / "data" / "processed"
+RAW = ROOT / SETTINGS["data"]["raw_dir"]
+PROCESSED = ROOT / SETTINGS["data"]["processed_dir"]
 
 TABLES = {
     "customers": (

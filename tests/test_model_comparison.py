@@ -40,29 +40,24 @@ class ComparisonTests(unittest.TestCase):
                                       else {"precision_at_k": 0.1, "recall_at_k": 0.1, "customers": 10})
                 save_run(model, report, {}, root / "runs", tracking, config["experiment"], group)
 
-    def test_approval_then_rejection_retains_active_models(self):
+    def test_comparison_prepares_bundles_without_changing_active_models(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            active = root / "active/forecast_model.pkl"
+            active.parent.mkdir()
+            active.write_bytes(b"existing active model")
             with isolated_tracking(root) as tracking:
-                self.log_group(root, tracking)
-                approved = compare_models("group", tracking, root / "models", root / "comparisons")
-                for task, report in approved.items():
-                    self.assertTrue(report["approved"])
-                    self.assertEqual(report["publication"], "published_trained_model")
-                    self.assertTrue(Path(report["model_path"]).is_file())
-                previous = {p.name: p.read_bytes() for p in (root / "models").iterdir()}
-                self.log_group(root, tracking, "rejected", approved=False)
-                rejected = compare_models("rejected", tracking, root / "models", root / "comparisons")
-                for report in rejected.values():
-                    self.assertFalse(report["approved"])
-                    self.assertEqual(report["publication"], "retained_existing_model")
-                self.assertEqual(previous, {p.name: p.read_bytes() for p in (root / "models").iterdir()})
-                # A first deployment of the same rejected candidates gets real baseline artifacts.
-                fallback = compare_models("rejected", tracking, root / "fallback", root / "comparisons")
-                for report in fallback.values():
-                    self.assertEqual(report["publication"], "published_baseline_fallback")
-                    model = joblib.load(report["model_path"])
-                    self.assertEqual(model.method, report["baseline"])
+                for group, approved in [("approved", True), ("rejected", False)]:
+                    self.log_group(root, tracking, group, approved=approved)
+                    decisions = compare_models(group, tracking, root / group / "models", root / group / "comparisons")
+                    for task, decision in decisions.items():
+                        self.assertEqual(decision["approved"], approved)
+                        self.assertEqual(decision["publication"], "awaiting_snapshot_and_activation")
+                        selected = joblib.load(decision["model_path"])
+                        self.assertTrue(selected.serving_metadata["approved_for_inference"])
+                        expected = decision["candidate"] if approved else decision["baseline"]
+                        self.assertEqual(selected.serving_metadata["model_name"], expected)
+                self.assertEqual(active.read_bytes(), b"existing active model")
 
     def test_missing_or_mismatched_groups_never_publish(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -85,7 +80,7 @@ class ComparisonTests(unittest.TestCase):
                     self.assertTrue(report["validation_approved"])
                     self.assertFalse(report["holdout_passed"])
                     self.assertFalse(report["approved"])
-                    self.assertEqual(report["publication"], "published_baseline_fallback")
+                    self.assertEqual(report["publication"], "awaiting_snapshot_and_activation")
 
     def test_multiple_candidates_select_validation_winner_without_test_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -115,7 +110,7 @@ class ComparisonTests(unittest.TestCase):
                     self.assertTrue(decision["validation_approved"])
                     self.assertFalse(decision["holdout_passed"])
                     self.assertFalse(decision["approved"])
-                    self.assertEqual(decision["publication"], "published_baseline_fallback")
+                    self.assertEqual(decision["publication"], "awaiting_snapshot_and_activation")
 
                 results = load_model_results("forecasting", "group")
                 results["challenger"]["validation"]["rmse"] = 4.0
@@ -134,7 +129,7 @@ class ComparisonTests(unittest.TestCase):
                     if run.data.tags.get("model") == "challenger":
                         client.delete_run(run.info.run_id)
                 with self.assertRaisesRegex(ValueError, "Incomplete"):
-                    compare_models("group", tracking, root / "missing_models", root / "comparisons")
+                    compare_models("group", tracking, root / "missing_models", root / "missing_comparisons")
                 self.assertFalse((root / "missing_models").exists())
 
     def test_real_sample_jobs_then_comparison(self):
@@ -160,7 +155,7 @@ class ComparisonTests(unittest.TestCase):
                 self.assertEqual(decisions["recommendation"]["candidate_run_id"], rec["mlflow_run_id"])
                 # The weekly fixture is perfectly forecast by a seasonal baseline.
                 self.assertFalse(decisions["forecasting"]["approved"])
-                self.assertEqual(decisions["forecasting"]["publication"], "published_baseline_fallback")
+                self.assertEqual(decisions["forecasting"]["publication"], "awaiting_snapshot_and_activation")
                 for task, decision in decisions.items():
                     active = joblib.load(decision["model_path"])
                     self.assertTrue(active.serving_metadata["approved_for_inference"])

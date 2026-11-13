@@ -17,12 +17,12 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.common.config import REPLAY
+from src.common.config import REPLAY, SETTINGS
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CURATED = ROOT / "data" / "curated"
-OUTPUT = ROOT / "data" / "features" / "forecasting"
+CURATED = ROOT / SETTINGS["data"]["curated_dir"]
+OUTPUT = ROOT / SETTINGS["data"]["forecasting_features"]
 
 
 def parse_args() -> argparse.Namespace:

@@ -96,7 +96,7 @@ def reset_repository(root: Path, *, dry_run: bool = True) -> None:
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
-    print("Reset complete. Start again with scripts/data/download_olist_data.py.")
+    print("Reset complete. Start again with scripts/data_processing/download_olist_data.py.")
 
 
 def main() -> int:

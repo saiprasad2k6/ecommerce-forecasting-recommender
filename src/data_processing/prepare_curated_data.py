@@ -12,10 +12,12 @@ import duckdb
 import pandas as pd
 
 
+from src.common.config import SETTINGS
+
 ROOT = Path(__file__).resolve().parents[2]
-PROCESSED = ROOT / "data" / "processed"
-CURATED = ROOT / "data" / "curated"
-WAREHOUSE = ROOT / "data" / "warehouse" / "olist.duckdb"
+PROCESSED = ROOT / SETTINGS["data"]["processed_dir"]
+CURATED = ROOT / SETTINGS["data"]["curated_dir"]
+WAREHOUSE = ROOT / SETTINGS["data"]["warehouse"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,8 +196,8 @@ def main() -> int:
     row_counts = write_outputs(tables, args.output_dir, args.warehouse, args.purchase_date)
     report = quality_report(tables, row_counts, args.purchase_date)
 
-    report_path = PROCESSED / "quality_report.json"
-    status_path = PROCESSED / "pipeline_status.json"
+    report_path = args.input_dir / "quality_report.json"
+    status_path = args.input_dir / "pipeline_status.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     status_path.write_text(
         json.dumps({"status": report["status"], "stage": "curated_data"}, indent=2),

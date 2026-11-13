@@ -40,7 +40,7 @@ def training_task(task_id, script, arguments, env):
 
 with DAG(
     dag_id="olist_model_training",
-    description="Validate inputs, evaluate baselines, train candidates, then compare matching MLflow runs",
+    description="Train from a published prepared version, compare and preserve release artifacts",
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     schedule=None,
     catchup=False,
@@ -54,62 +54,46 @@ with DAG(
     },
     tags=["olist", "models", "training"],
     params={
+        "prepared_version": Param(type="string", pattern="^[0-9a-f]{64}$", description="Published prepared version ID; no latest-data fallback"),
+        "release": Param(SETTINGS["release"]["require_clean_git"], type="boolean"),
         **{name: Param(REPLAY[name], type="string", format="date") for name in
            ["training_start", "validation_start", "test_start", "monitoring_start"]},
-        "max_train_rows": Param(1_000_000, type="integer", minimum=2),
-        "forecast_estimators": Param(100, type="integer", minimum=1),
-        "ranking_estimators": Param(100, type="integer", minimum=1),
+        "max_train_rows": Param(SETTINGS["training"]["max_train_rows"], type="integer", minimum=2),
+        "forecast_estimators": Param(SETTINGS["training"]["forecast_estimators"], type="integer", minimum=1),
+        "ranking_estimators": Param(SETTINGS["training"]["ranking_estimators"], type="integer", minimum=1),
+        "seed": Param(SETTINGS["training"]["seed"], type="integer", minimum=0),
         "candidate_limit": Param(SETTINGS["recommendation"]["candidate_limit"], type="integer", minimum=10),
         "top_k": Param(SETTINGS["recommendation"]["top_k"], type="integer", minimum=1),
     },
     doc_md="""
-    Run `olist_data_preparation` successfully before triggering this DAG.
-    Baseline jobs and candidate jobs log separate MLflow runs sharing this DAG run ID.
-    Model jobs are registered in configs/production_models.json. Validation ranks
-    all configured candidates; test only checks the chosen validation winner.
-    The final comparison task verifies evaluation fingerprints and publishes approved
-    candidates, or an initial baseline fallback. Tasks run serially for SQLite/DuckDB.
-    This DAG writes local artifacts; it does not
-    deploy an API or download/rebuild input data. Validation chooses whether to
-    select a trained candidate; a frozen holdout check can veto its publication.
-    Failed candidates keep the existing model/baseline fallback.
-    Check each versioned report's `approved` and `publication` fields: a successful
-    DAG run does not imply that both trained candidates passed their gates.
-    Recommendation defaults use March–May 2018 training, June validation and July test.
-    August is reserved for inference and monitoring.
+    Run olist_data_preparation, then commit its snapshots/ metadata before
+    training. All jobs use that version and the resolved parameters in its manifest.
+    Comparison only prepares selected bundles. Upload the complete run and back up
+    MLflow before a separately triggered activation release. Rejected candidates retain existing active models;
+    a first deployment can activate the selected baseline fallback.
+    Commit snapshots/ metadata through the normal Git review/release workflow.
+    Use a new run ID to retrain; retries reuse the frozen inputs.
     """,
 ) as dag:
-    validate_inputs = training_task(
-        "validate_training_inputs",
-        "validate_inputs.py",
-        '--candidate-limit "$CANDIDATES" --top-k "$TOP_K"',
-        env={
-            "CANDIDATES": "{{ params.candidate_limit }}",
-            "TOP_K": "{{ params.top_k }}",
-        },
+    snapshot = training_task(
+        "select_prepared_version", "../versioning/snapshot.py",
+        'begin-training --pipeline-run-id "$PIPELINE_RUN_ID" --prepared-version "$PREPARED_VERSION" {{ "" if params.release else "--development" }}',
+        env={"OLIST_PARAMETERS": "{{ params | tojson }}", "PREPARED_VERSION": "{{ params.prepared_version }}"},
     )
-    forecast_baselines = training_task(
-        "evaluate_forecasting_baselines", "forecasting/forecasting_baseline.py",
-        '--pipeline-run-id "$PIPELINE_RUN_ID"', env={},
-    )
-    recommendation_baselines = training_task(
-        "evaluate_recommendation_baselines", "recommendation/recommendation_baseline.py",
-        '--pipeline-run-id "$PIPELINE_RUN_ID" --candidate-limit "$CANDIDATES" --top-k "$TOP_K"'
-        ' --validation-cutoff "$VALIDATION_START" --test-cutoff "$TEST_START" --test-end "$MONITORING_START"',
-        env={"CANDIDATES": "{{ params.candidate_limit }}", "TOP_K": "{{ params.top_k }}",
-             **{name.upper(): "{{ params." + name + " }}" for name in
-                ["validation_start", "test_start", "monitoring_start"]}},
-    )
-    previous = recommendation_baselines
+    previous = snapshot
+    for task in ["forecasting", "recommendation"]:
+        baseline = training_task(
+            f"evaluate_{task}_baselines", "run_job.py",
+            f'--pipeline-run-id "$PIPELINE_RUN_ID" --task {task} --model baselines', env={},
+        )
+        previous >> baseline
+        previous = baseline
     for task, models in MODEL_JOBS.items():
-        for model_name, job in models.items():
-            arguments = '--pipeline-run-id "$PIPELINE_RUN_ID"'
-            env = {}
-            for flag, parameter in job["parameters"].items():
-                env[parameter.upper()] = "{{ params." + parameter + " }}"
-                arguments += f' --{flag} "${parameter.upper()}"'
+        for model_name in models:
             training = training_task(
-                f"train_{task}_{model_name}", job["script"], arguments, env,
+                f"train_{task}_{model_name}", "run_job.py",
+                '--pipeline-run-id "$PIPELINE_RUN_ID" --task "$MODEL_TASK" --model "$MODEL_NAME"',
+                env={"MODEL_TASK": task, "MODEL_NAME": model_name},
             )
             previous >> training
             previous = training
@@ -117,5 +101,22 @@ with DAG(
         "compare_models", "comparison/compare_models.py",
         '--pipeline-run-id "$PIPELINE_RUN_ID"', env={},
     )
-    validate_inputs >> forecast_baselines >> recommendation_baselines
-    previous >> comparison
+    preserve = training_task(
+        "preserve_run_snapshot", "../versioning/snapshot.py",
+        'artifacts --pipeline-run-id "$PIPELINE_RUN_ID"', env={},
+    )
+    backup = training_task(
+        "backup_mlflow", "../versioning/snapshot.py", "backup-mlflow", env={},
+    )
+    release = training_task(
+        "release_workspace", "../versioning/snapshot.py",
+        'release-workspace --kind train --pipeline-run-id "$PIPELINE_RUN_ID"', env={},
+    )
+    release.trigger_rule = "all_done"
+    watcher = BashOperator(task_id="workflow_failed", bash_command="exit 1", trigger_rule="one_failed", retries=0)
+    previous >> comparison >> preserve >> backup
+    business = [task for task in dag.tasks if task not in [release, watcher]]
+    for task in business:
+        task >> release
+        task >> watcher
+    release >> watcher

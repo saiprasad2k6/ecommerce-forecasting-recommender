@@ -228,3 +228,8 @@ documents/*
 mlruns/
 airflow/
 
+
+# Separate operational database backups
+/backups/
+
+.vscode

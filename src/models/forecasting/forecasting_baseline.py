@@ -1,6 +1,7 @@
 """Evaluate next-day forecasting rules and log independent MLflow runs."""
 
 import argparse
+from src.common.config import SETTINGS
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -45,7 +46,7 @@ class BaselineForecaster:
 
 
 def run_pipeline(
-    features_dir=ROOT / "data/features/forecasting",
+    features_dir=ROOT / SETTINGS["data"]["forecasting_features"],
     output_dir=ROOT / "data/baselines/forecasting",
     tracking_uri=TRACKING_URI,
     pipeline_run_id=None,
@@ -78,7 +79,7 @@ def run_pipeline(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--features-dir", type=Path, default=ROOT / "data/features/forecasting"
+        "--features-dir", type=Path, default=ROOT / SETTINGS["data"]["forecasting_features"]
     )
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "data/baselines/forecasting"

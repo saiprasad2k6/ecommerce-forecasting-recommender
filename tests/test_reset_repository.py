@@ -20,9 +20,9 @@ class ResetRepositoryTests(unittest.TestCase):
             root = Path(directory)
             for name in ["data/raw/input.csv", "data/warehouse/olist.duckdb", "mlruns/run/artifact.csv",
                          "mlartifacts/run/result.csv", "artifacts/report.json", "models/model.pkl",
-                         "src/data/clean.py", "scripts/data/download.py", "configs/settings.yaml",
+                         "src/data_processing/clean.py", "scripts/data_processing/download.py", "configs/settings.yaml",
                          ".git/config", ".venv/keep", ".env", "documents/notes.md",
-                         "src/data/__pycache__/clean.pyc", ".pytest_cache/state"]:
+                         "src/data_processing/__pycache__/clean.pyc", ".pytest_cache/state"]:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("keep or remove")
@@ -40,9 +40,9 @@ class ResetRepositoryTests(unittest.TestCase):
             self.run_reset(root)
             self.assertEqual(before, {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()})
             self.run_reset(root, dry_run=False)
-            for name in ["data", "mlruns", "mlartifacts", "artifacts", "models", ".pytest_cache", "src/data/__pycache__"]:
+            for name in ["data", "mlruns", "mlartifacts", "artifacts", "models", ".pytest_cache", "src/data_processing/__pycache__"]:
                 self.assertFalse((root / name).exists())
-            for name in ["src/data/clean.py", "scripts/data/download.py", "configs/settings.yaml",
+            for name in ["src/data_processing/clean.py", "scripts/data_processing/download.py", "configs/settings.yaml",
                          ".git/config", ".venv/keep", ".env", "documents/notes.md"]:
                 self.assertEqual((root / name).read_bytes(), before[Path(name)])
             cleaned = json.loads(path.read_text())
@@ -91,7 +91,7 @@ class ResetRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             remove = ["__pycache__/root.pyc", "configs/__pycache__/settings.pyc",
-                      "custom_tools/nested/__pycache__/tool.pyc", "src/data/__pycache__/clean.pyc",
+                      "custom_tools/nested/__pycache__/tool.pyc", "src/data_processing/__pycache__/clean.pyc",
                       "custom_tools/legacy.pyc", "custom_tools/legacy.pyo"]
             preserve = [".venv/lib/__pycache__/package.pyc", ".git/hooks/__pycache__/hook.pyc",
                         "custom_env/lib/__pycache__/package.pyc", "custom_tools/tool.py"]
@@ -108,7 +108,7 @@ class ResetRepositoryTests(unittest.TestCase):
                 self.assertFalse((root / name).exists())
             for name in preserve:
                 self.assertEqual((root / name).read_text(), "original")
-            for name in ["__pycache__", "configs/__pycache__", "custom_tools/nested/__pycache__", "src/data/__pycache__"]:
+            for name in ["__pycache__", "configs/__pycache__", "custom_tools/nested/__pycache__", "src/data_processing/__pycache__"]:
                 self.assertFalse((root / name).exists())
 
 

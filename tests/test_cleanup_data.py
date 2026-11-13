@@ -20,7 +20,7 @@ class CleanupDataTests(unittest.TestCase):
             data_files = ["raw/dataset.zip", "raw/orders.csv", "processed/orders.csv",
                           "curated/orders.csv", "features/train.parquet", "warehouse/olist.duckdb",
                           "warehouse/olist.sqlite", "warehouse/olist.sqlite-wal", "baselines/mlflow.db"]
-            preserved = ["src/data/source.py", "mlruns/artifact.csv", "models/model.pkl",
+            preserved = ["src/data_processing/source.py", "mlruns/artifact.csv", "models/model.pkl",
                          "notebooks/example.ipynb", ".venv/keep", ".git/config"]
             for filename in [*[f"data/{name}" for name in data_files], *preserved]:
                 path = root / filename

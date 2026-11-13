@@ -1,4 +1,4 @@
-"""Generate predictions using only the model activated by comparison."""
+"""Generate predictions using only the model activated from a preserved selection."""
 import argparse
 import json
 from pathlib import Path
@@ -9,6 +9,7 @@ import duckdb
 import joblib
 import pandas as pd
 
+from src.common.config import SETTINGS
 from src.models.common import MODEL_FILES, ROOT
 from src.models.datasets import RecommendationSnapshot, load_history
 
@@ -17,16 +18,23 @@ def load_active_model(task, models_dir):
     """An active artifact can contain any algorithm or a selected baseline."""
     path = Path(models_dir) / MODEL_FILES[task]
     if not path.is_file():
-        raise FileNotFoundError(f"No active {task} model at {path}; run model comparison first")
+        raise FileNotFoundError(f"No active {task} model at {path}; activate an uploaded model selection first")
     model = joblib.load(path)
     metadata = getattr(model, "serving_metadata", {})
     if metadata.get("approved_for_inference") is not True or metadata.get("task") != task:
-        raise ValueError(f"{path} has no matching serving approval; publish it through model comparison")
+        raise ValueError(f"{path} has no matching serving approval; activate a preserved model selection")
     return model
 
 
-def run_pipeline(task, as_of, input_path, models_dir=ROOT / "models",
-                 output_dir=ROOT / "data/predictions", pipeline_run_id=None):
+def run_pipeline(task, as_of, input_path, models_dir=ROOT / SETTINGS["inference"]["models_dir"],
+                 output_dir=ROOT / SETTINGS["inference"]["output_dir"], pipeline_run_id=None):
+    from src.versioning.workspace import locked
+    with locked():
+        return _run_pipeline(task, as_of, input_path, models_dir, output_dir, pipeline_run_id)
+
+
+def _run_pipeline(task, as_of, input_path, models_dir=ROOT / SETTINGS["inference"]["models_dir"],
+                 output_dir=ROOT / SETTINGS["inference"]["output_dir"], pipeline_run_id=None):
     """Forecast features are dated as_of; recommendation history is before as_of."""
     as_of = pd.Timestamp(as_of)
     model = load_active_model(task, models_dir)
@@ -82,8 +90,8 @@ def main():
     parser.add_argument("--as-of", required=True)
     parser.add_argument("--input-path", type=Path, required=True,
                         help="Forecast feature Parquet file, or recommendation DuckDB warehouse")
-    parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/predictions")
+    parser.add_argument("--models-dir", type=Path, default=ROOT / SETTINGS["inference"]["models_dir"])
+    parser.add_argument("--output-dir", type=Path, default=ROOT / SETTINGS["inference"]["output_dir"])
     parser.add_argument("--pipeline-run-id")
     print(json.dumps(run_pipeline(**vars(parser.parse_args())), indent=2))
     return 0

@@ -11,4 +11,9 @@ from src.features.build_recommendation_features import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import os
+    from src.versioning.workspace import locked
+    if os.environ.get("OLIST_MANAGED_PREPARATION"):
+        raise SystemExit(main())
+    with locked():
+        raise SystemExit(main())

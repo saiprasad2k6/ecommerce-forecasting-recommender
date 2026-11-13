@@ -1,0 +1,33 @@
+name: olist-storage
+services:
+  permissions:
+    image: alpine:3.22
+    user: '0:0'
+    command: ['sh', '-c', 'chown 10001:10001 /data /logs']
+    volumes:
+      - rustfs-data:/data
+      - rustfs-logs:/logs
+    restart: 'no'
+  rustfs:
+    image: rustfs/rustfs:1.0.0
+    depends_on:
+      permissions:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:${RUSTFS_API_PORT:-19000}:9000'
+      - '127.0.0.1:${RUSTFS_CONSOLE_PORT:-19001}:9001'
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?Run scripts/storage/start_rustfs.py first}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?Run scripts/storage/start_rustfs.py first}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: '0.0.0.0:9000'
+      RUSTFS_CONSOLE_ADDRESS: '0.0.0.0:9001'
+      RUSTFS_CONSOLE_ENABLE: 'true'
+      RUSTFS_OBS_LOG_DIRECTORY: /logs
+    volumes:
+      - rustfs-data:/data
+      - rustfs-logs:/logs
+volumes:
+  rustfs-data:
+  rustfs-logs:

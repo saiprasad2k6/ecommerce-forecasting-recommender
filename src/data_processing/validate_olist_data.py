@@ -11,13 +11,15 @@ from pathlib import Path
 import yaml
 
 
+from src.common.config import SETTINGS
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCHEMA = PROJECT_ROOT / "configs" / "schema.yaml"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", type=Path, default=PROJECT_ROOT / "data" / "raw")
+    parser.add_argument("--input-dir", type=Path, default=PROJECT_ROOT / SETTINGS["data"]["raw_dir"])
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     return parser.parse_args()
 

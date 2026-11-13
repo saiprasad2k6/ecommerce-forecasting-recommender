@@ -1,4 +1,4 @@
-"""Manual batch inference using only models activated by comparison."""
+"""Manual batch inference using only models activated from preserved snapshots."""
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -31,7 +31,7 @@ with DAG(
     },
     tags=["olist", "inference"],
     doc_md="""
-    Run training/comparison first to publish serving-approved model bundles.
+    Complete training, comparison, artifact upload and activation first.
     Defaults replay historical inputs; set as_of and input paths for each batch.
     Forecasting predicts the day after its feature date. Recommendations use only
     history before as_of. Neither task selects or trains models.

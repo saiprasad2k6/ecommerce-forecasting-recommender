@@ -61,7 +61,7 @@ def prepare_data(warehouse, start, end, candidate_limit=100):
     return pd.concat(frames, ignore_index=True), np.asarray(targets), groups
 
 
-def train_model(train, validation, n_estimators=100, seed=42, top_k=10):
+def train_model(train, validation, n_estimators=SETTINGS["training"]["ranking_estimators"], seed=SETTINGS["training"]["seed"], top_k=10):
     """Fit the ranker, stopping when validation Precision@K stops improving."""
     features, targets, groups = train
     validation_features, validation_targets, validation_groups = validation
@@ -101,7 +101,7 @@ def train_model(train, validation, n_estimators=100, seed=42, top_k=10):
 
 
 def run_pipeline(
-    warehouse=ROOT / "data/warehouse/olist.duckdb",
+    warehouse=ROOT / SETTINGS["data"]["warehouse"],
     output_dir=ROOT / "data/production/lightgbm/recommendations",
     tracking_uri=TRACKING_URI,
     training_start=REPLAY["training_start"],
@@ -110,8 +110,8 @@ def run_pipeline(
     test_end=REPLAY["monitoring_start"],
     candidate_limit=SETTINGS["recommendation"]["candidate_limit"],
     top_k=SETTINGS["recommendation"]["top_k"],
-    n_estimators=100,
-    seed=42,
+    n_estimators=SETTINGS["training"]["ranking_estimators"],
+    seed=SETTINGS["training"]["seed"],
     pipeline_run_id=None,
 ):
     # Validate the date windows and recommendation size.
@@ -186,7 +186,7 @@ def run_pipeline(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--warehouse", type=Path, default=ROOT / "data/warehouse/olist.duckdb"
+        "--warehouse", type=Path, default=ROOT / SETTINGS["data"]["warehouse"]
     )
     parser.add_argument(
         "--output-dir",
@@ -207,8 +207,8 @@ def main():
     parser.add_argument(
         "--top-k", type=int, default=SETTINGS["recommendation"]["top_k"]
     )
-    parser.add_argument("--n-estimators", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-estimators", type=int, default=SETTINGS["training"]["ranking_estimators"])
+    parser.add_argument("--seed", type=int, default=SETTINGS["training"]["seed"])
 
     report = run_pipeline(**vars(parser.parse_args()))
     print(f"Pipeline run: {report['pipeline_run_id']}")

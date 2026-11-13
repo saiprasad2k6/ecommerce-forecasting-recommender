@@ -1,4 +1,4 @@
-"""Compare matching MLflow runs and publish approved models or baseline fallbacks."""
+"""Compare model runs and preserve selections without activating them."""
 import argparse
 import json
 from pathlib import Path
@@ -11,7 +11,8 @@ import pandas as pd
 
 from src.models.forecasting.forecasting_baseline import METHODS as FORECAST_BASELINES
 from src.models.recommendation.recommendation_baseline import METHODS as REC_BASELINES
-from src.models.common import ROOT, TRACKING_URI, MODEL_FILES, publish_model, set_experiment
+from src.models.common import ROOT, TRACKING_URI, MODEL_FILES, set_experiment
+from src.versioning.snapshots import load_run, run_dir, write_json
 
 MODEL_JOBS = json.loads((ROOT / "configs/production_models.json").read_text())
 
@@ -123,7 +124,7 @@ def compare_model_results(task, model_results):
 
 
 def save_comparison(decision, model, output_dir):
-    """Log the decision, publish the selected model, and save the final report."""
+    """Log the decision and save a serving-ready bundle for later activation."""
     set_experiment(TASKS[decision["task"]]["experiment"])
     with mlflow.start_run(run_name="comparison") as run:
         mlflow.set_tags({
@@ -146,9 +147,16 @@ def save_comparison(decision, model, output_dir):
             "evaluation_id": decision["evaluation_id"],
             **decision["inference_parameters"],
         }
-        decision["publication"] = publish_model(
-            model, Path(decision["model_path"]), decision["approved"], metadata=selection,
-        )
+        directory = run_dir(decision["pipeline_run_id"])
+        if (directory / "manifest.json").exists():
+            manifest = load_run(decision["pipeline_run_id"])
+            selection.update({key: manifest[key] for key in ["prepared_version", "raw_version", "git_commit"]})
+        model.serving_metadata = selection
+        path = Path(decision["model_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, path)
+        decision["publication"] = "awaiting_snapshot_and_activation"
+        mlflow.log_artifact(str(path), "selected_model")
         decision["comparison_run_id"] = run.info.run_id
         output = Path(output_dir) / run.info.run_id
         output.mkdir(parents=True)
@@ -156,25 +164,62 @@ def save_comparison(decision, model, output_dir):
         mlflow.log_dict(decision, "report.json")
 
 
-def compare_models(pipeline_run_id, tracking_uri=TRACKING_URI, models_dir=ROOT / "models", output_dir=ROOT / "data/comparisons"):
-    """Load model results, compare models, then save both decisions."""
+def compare_models(pipeline_run_id, tracking_uri=TRACKING_URI, models_dir=None, output_dir=None):
+    from src.versioning.workspace import training_guard
+    with training_guard(pipeline_run_id):
+        return _compare_models(pipeline_run_id, tracking_uri, models_dir, output_dir)
+
+
+def _compare_models(pipeline_run_id, tracking_uri=TRACKING_URI, models_dir=None, output_dir=None):
+    """Compare all tasks before writing selections; never change active models."""
+    directory = run_dir(pipeline_run_id)
+    output_dir = Path(output_dir) if output_dir is not None else directory / "selection"
+    models_dir = Path(models_dir) if models_dir is not None else output_dir / "models"
+    decisions_file = output_dir / "decisions.json"
+    if (directory / "manifest.json").exists():
+        from src.versioning.snapshots import validate_run_context
+        validate_run_context(load_run(pipeline_run_id))
+    if decisions_file.exists():
+        decisions = json.loads(decisions_file.read_text())
+        if any(d["pipeline_run_id"] != pipeline_run_id for d in decisions.values()):
+            raise ValueError("Selection directory belongs to another run")
+        return decisions
     mlflow.set_tracking_uri(tracking_uri)
     decisions, models = {}, {}
     client = MlflowClient()
     with tempfile.TemporaryDirectory() as temporary:
-        for task in TASKS:
-            model_results = load_model_results(task, pipeline_run_id)
+        for task, config in TASKS.items():
+            if (directory / "manifest.json").exists():
+                model_results, artifacts = {}, {}
+                for name in [*config["baselines"], *config["candidates"]]:
+                    entry = json.loads((directory / "jobs" / task / f"{name}.json").read_text())
+                    model_results[name] = json.loads((directory / entry["report"]).read_text())
+                    artifacts[name] = directory / entry["model"]
+            else:
+                model_results = load_model_results(task, pipeline_run_id)
+                artifacts = None
             decision = compare_model_results(task, model_results)
             decision["pipeline_run_id"] = pipeline_run_id
-            decision["model_path"] = str(Path(models_dir) / MODEL_FILES[task])
+            decision["model_path"] = str(models_dir / MODEL_FILES[task])
+            selected = decision["candidate"] if decision["approved"] else decision["baseline"]
             run_id = decision["candidate_run_id"] if decision["approved"] else decision["baseline_run_id"]
-            artifact = client.download_artifacts(run_id, "model.pkl", temporary)
+            artifact = artifacts[selected] if artifacts else client.download_artifacts(run_id, "model.pkl", temporary)
             models[task] = joblib.load(artifact)
             decisions[task] = decision
-
-    # Both comparisons and artifact loads must succeed before publishing either model.
     for task, decision in decisions.items():
-        save_comparison(decision, models[task], output_dir)
+        save_comparison(decision, models[task], output_dir / "reports")
+    if (directory / "manifest.json").exists():
+        manifest = load_run(pipeline_run_id)
+        manifest["mlflow_run_ids"] = {
+            task: {name: json.loads(path.read_text())["mlflow_run_id"]
+                   for path in (directory / "jobs" / task).glob("*.json")
+                   for name in [path.stem]}
+            for task in TASKS}
+        manifest["selection"] = {task: {key: decision[key] for key in
+                                 ["candidate", "baseline", "approved", "comparison_run_id"]}
+                                 for task, decision in decisions.items()}
+        write_json(directory / "manifest.json", manifest)
+    write_json(decisions_file, decisions)
     return decisions
 
 
@@ -182,7 +227,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pipeline-run-id", required=True)
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
-    parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/comparisons")
+    parser.add_argument("--models-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
     print(json.dumps(compare_models(**vars(parser.parse_args())), indent=2))
     return 0

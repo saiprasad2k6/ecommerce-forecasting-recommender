@@ -5,6 +5,8 @@ import json
 from uuid import uuid4
 import os
 from pathlib import Path
+
+from src.common.config import SETTINGS
 import tempfile
 
 os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
@@ -14,7 +16,9 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[2]
-TRACKING_URI = f"sqlite:///{ROOT / 'data/baselines/mlflow.db'}"
+TRACKING_URI = SETTINGS["tracking"]["uri"]
+if TRACKING_URI.startswith("sqlite:///") and not Path(TRACKING_URI.removeprefix("sqlite:///")).is_absolute():
+    TRACKING_URI = "sqlite:///" + str(ROOT / TRACKING_URI.removeprefix("sqlite:///"))
 MODEL_FILES = {"forecasting": "forecast_model.pkl", "recommendation": "recommender.pkl"}
 
 
@@ -76,7 +80,7 @@ def set_experiment(name):
 
 
 def save_run(model, report, params, output_dir, tracking_uri, experiment, pipeline_run_id=None):
-    """Log one independently evaluated model. Publication belongs to comparison."""
+    """Log one independently evaluated model. Activation is a separate operation."""
     (ROOT / "data/baselines").mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(tracking_uri)
     set_experiment(experiment)
@@ -90,6 +94,12 @@ def save_run(model, report, params, output_dir, tracking_uri, experiment, pipeli
         mlflow.log_params(params)
         mlflow.set_tags({key: report[key] for key in ["task", "role", "model", "pipeline_run_id"]})
         mlflow.set_tag("evaluation_id", report["evaluation_context"]["evaluation_id"])
+        from src.versioning.snapshots import run_dir, load_run
+        if (run_dir(report["pipeline_run_id"]) / "manifest.json").exists():
+            manifest = load_run(report["pipeline_run_id"])
+            mlflow.set_tags({key: str(manifest[key]) for key in
+                             ["git_commit", "git_dirty", "git_diff_sha256", "raw_version", "prepared_version", "environment_sha256"]})
+            mlflow.log_dict(manifest, "input_manifest.json")
         for split, prefix in [("validation", "val"), ("test", "test")]:
             mlflow.log_metrics({prefix + "_" + key: value for key, value in report[split].items()
                                 if key not in ["rows", "customers"]})

@@ -9,6 +9,7 @@ from lightgbm import LGBMRegressor, early_stopping
 import numpy as np
 import pandas as pd
 
+from src.common.config import SETTINGS
 from src.models.datasets import NUMERIC_FEATURES, feature_query
 from src.models.evaluation import evaluate_forecasting as evaluate_model
 from src.models.common import ROOT, TRACKING_URI, forecast_context, save_run
@@ -89,7 +90,7 @@ def prepare_data(features_dir, max_rows=1_000_000, seed=42):
     return train, validation, np.asarray(weights), metadata
 
 
-def train_model(train, validation, weights, n_estimators=100, seed=42):
+def train_model(train, validation, weights, n_estimators=SETTINGS["training"]["forecast_estimators"], seed=42):
     """Fit a next-day forecaster; validation MAE controls early stopping."""
     encodings = {
         column: pd.Index(sorted(train[column].unique()))
@@ -117,12 +118,12 @@ def train_model(train, validation, weights, n_estimators=100, seed=42):
 
 
 def run_pipeline(
-    features_dir=ROOT / "data/features/forecasting",
+    features_dir=ROOT / SETTINGS["data"]["forecasting_features"],
     output_dir=ROOT / "data/production/lightgbm/forecasting",
     tracking_uri=TRACKING_URI,
-    max_train_rows=1_000_000,
-    n_estimators=100,
-    seed=42,
+    max_train_rows=SETTINGS["training"]["max_train_rows"],
+    n_estimators=SETTINGS["training"]["forecast_estimators"],
+    seed=SETTINGS["training"]["seed"],
     pipeline_run_id=None,
 ):
     context = forecast_context(features_dir)
@@ -162,16 +163,16 @@ def run_pipeline(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--features-dir", type=Path, default=ROOT / "data/features/forecasting"
+        "--features-dir", type=Path, default=ROOT / SETTINGS["data"]["forecasting_features"]
     )
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "data/production/lightgbm/forecasting"
     )
     parser.add_argument("--pipeline-run-id")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
-    parser.add_argument("--max-train-rows", type=int, default=1_000_000)
-    parser.add_argument("--n-estimators", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-train-rows", type=int, default=SETTINGS["training"]["max_train_rows"])
+    parser.add_argument("--n-estimators", type=int, default=SETTINGS["training"]["forecast_estimators"])
+    parser.add_argument("--seed", type=int, default=SETTINGS["training"]["seed"])
     report = run_pipeline(**vars(parser.parse_args()))
     print(f"Pipeline run: {report['pipeline_run_id']}")
     return 0

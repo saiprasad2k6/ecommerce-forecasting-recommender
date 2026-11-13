@@ -40,7 +40,7 @@ class BaselineRecommender:
 
 
 def run_pipeline(
-    warehouse=ROOT / "data/warehouse/olist.duckdb",
+    warehouse=ROOT / SETTINGS["data"]["warehouse"],
     output_dir=ROOT / "data/baselines/recommendations",
     tracking_uri=TRACKING_URI,
     validation_cutoff=REPLAY["validation_start"],
@@ -97,7 +97,7 @@ def run_pipeline(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--warehouse", type=Path, default=ROOT / "data/warehouse/olist.duckdb"
+        "--warehouse", type=Path, default=ROOT / SETTINGS["data"]["warehouse"]
     )
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "data/baselines/recommendations"

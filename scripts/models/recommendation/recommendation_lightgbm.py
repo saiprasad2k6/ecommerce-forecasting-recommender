@@ -11,4 +11,9 @@ from src.models.recommendation.recommendation_lightgbm import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import os
+    from src.versioning.workspace import locked
+    if os.environ.get("OLIST_MANAGED_PREPARATION"):
+        raise SystemExit(main())
+    with locked():
+        raise SystemExit(main())

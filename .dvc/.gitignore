@@ -1,0 +1,8 @@
+/config.local
+/tmp
+/cache
+
+/snapshot.lock
+
+/workspace.lock
+/workspace.json

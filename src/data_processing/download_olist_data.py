@@ -8,7 +8,9 @@ from pathlib import Path
 import subprocess
 
 
-DATASET = "olistbr/brazilian-ecommerce"
+from src.common.config import SETTINGS
+
+DATASET = SETTINGS["data"]["dataset"]
 EXPECTED_FILES = {
     "olist_customers_dataset.csv",
     "olist_geolocation_dataset.csv",
@@ -24,7 +26,7 @@ EXPECTED_FILES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parents[2] / SETTINGS["data"]["raw_dir"])
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()

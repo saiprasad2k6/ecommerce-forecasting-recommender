@@ -8,6 +8,7 @@ before --as-of are used. No availability, views, brands or discounts are inferre
 from __future__ import annotations
 
 import argparse
+from src.common.config import SETTINGS
 import json
 from pathlib import Path
 
@@ -163,14 +164,14 @@ def build_candidates(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--warehouse", type=Path, default=ROOT / "data/warehouse/olist.duckdb")
+    parser.add_argument("--warehouse", type=Path, default=ROOT / SETTINGS["data"]["warehouse"])
     parser.add_argument("--customer-id", required=True, help="customer_unique_id, not customer_id")
     parser.add_argument("--state", required=True)
     parser.add_argument("--as-of", required=True, help="Exclusive cutoff, e.g. 2018-08-01")
-    parser.add_argument("--candidate-limit", type=int, default=50)
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--candidate-limit", type=int, default=SETTINGS["recommendation"]["candidate_limit"])
+    parser.add_argument("--top-k", type=int, default=SETTINGS["recommendation"]["top_k"])
     parser.add_argument("--include-purchased", action="store_true")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data/features/recommendations")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / SETTINGS["data"]["recommendation_features"])
     args = parser.parse_args()
     if args.top_k <= 0:
         parser.error("top-k must be positive")
