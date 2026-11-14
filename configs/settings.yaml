@@ -29,6 +29,7 @@ inference:
   warehouse: data/warehouse/olist.duckdb
   models_dir: models
   output_dir: data/predictions
+  predictions_database: data/warehouse/predictions.duckdb
 # Proposed settings; the monitoring job is not implemented yet.
 monitoring:
   window_days: 7

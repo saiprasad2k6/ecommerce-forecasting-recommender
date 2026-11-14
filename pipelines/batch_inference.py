@@ -28,11 +28,15 @@ with DAG(
         "warehouse": Param(SETTINGS["inference"]["warehouse"], type="string", minLength=1),
         "models_dir": Param(SETTINGS["inference"]["models_dir"], type="string", minLength=1),
         "output_dir": Param(SETTINGS["inference"]["output_dir"], type="string", minLength=1),
+        "reference_dir": Param(SETTINGS["data"]["processed_dir"], type="string", minLength=1),
+        "predictions_database": Param(SETTINGS["inference"]["predictions_database"], type="string", minLength=1),
     },
     tags=["olist", "inference"],
     doc_md="""
     Complete training, comparison, artifact upload and activation first.
     Defaults replay historical inputs; set as_of and input paths for each batch.
+    After both prediction tasks succeed, load_predictions loads their Parquet
+    outputs into the predictions DuckDB database for DBeaver.
     Forecasting predicts the day after its feature date. Recommendations use only
     history before as_of. Neither task selects or trains models.
     """,
@@ -49,4 +53,18 @@ with DAG(
                  "PIPELINE_RUN_ID": "{{ run_id }}", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
             append_env=True, do_xcom_push=False, skip_on_exit_code=None,
         ))
-    tasks[0] >> tasks[1]
+    load = BashOperator(
+        task_id="load_predictions", cwd=str(ROOT),
+        bash_command=(
+            f'export PATH={shlex.quote(str(Path(PYTHON).parent))}:"$PATH"\nexec '
+            + shlex.join([PYTHON, str(ROOT / "scripts/inference/load_predictions.py")])
+            + ' --predictions-dir "$PREDICTIONS_DIR" --reference-dir "$REFERENCE_DIR"'
+            + ' --database "$PREDICTIONS_DATABASE" --batch-run-id "$BATCH_RUN_ID"'
+            + ' --pipeline-run-id "$BATCH_RUN_ID"'
+        ),
+        env={"PREDICTIONS_DIR": "{{ params.output_dir }}", "REFERENCE_DIR": "{{ params.reference_dir }}",
+             "PREDICTIONS_DATABASE": "{{ params.predictions_database }}", "BATCH_RUN_ID": "{{ run_id }}",
+             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
+        append_env=True, do_xcom_push=False, skip_on_exit_code=None,
+    )
+    tasks[0] >> tasks[1] >> load

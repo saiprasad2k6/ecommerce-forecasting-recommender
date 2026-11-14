@@ -1,5 +1,7 @@
 """Generate predictions using only the model activated from a preserved selection."""
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -39,6 +41,19 @@ def _run_pipeline(task, as_of, input_path, models_dir=ROOT / SETTINGS["inference
     as_of = pd.Timestamp(as_of)
     model = load_active_model(task, models_dir)
     selection = model.serving_metadata
+    pipeline_run_id = pipeline_run_id or uuid4().hex
+    batch_key = hashlib.sha256(pipeline_run_id.encode()).hexdigest()[:24]
+    output = (Path(output_dir) / task / f"as_of={as_of.date()}"
+              / f"model_run_id={selection['model_run_id']}" / f"batch_run_key={batch_key}")
+    path = output / "predictions.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+        if not (existing.pipeline_run_id.eq(pipeline_run_id).all()
+                and existing.model_run_id.eq(selection["model_run_id"]).all()
+                and pd.to_datetime(existing.as_of).eq(as_of).all()):
+            raise ValueError("Existing batch output identity differs; use a new batch run ID")
+        return {"task": task, "model_name": selection["model_name"],
+                "model_run_id": selection["model_run_id"], "rows": len(existing), "output": str(path)}
     if task == "forecasting":
         with duckdb.connect() as db:
             features = db.execute("""
@@ -68,11 +83,9 @@ def _run_pipeline(task, as_of, input_path, models_dir=ROOT / SETTINGS["inference
     predictions["model_role"] = selection["model_role"]
     predictions["model_run_id"] = selection["model_run_id"]
     predictions["training_pipeline_run_id"] = selection["training_pipeline_run_id"]
-    predictions["pipeline_run_id"] = pipeline_run_id or uuid4().hex
-    output = (Path(output_dir) / task / f"as_of={as_of.date()}"
-              / f"model_run_id={selection['model_run_id']}")
+    predictions["pipeline_run_id"] = pipeline_run_id
+    predictions["generated_at"] = datetime.now(timezone.utc).isoformat()
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "predictions.parquet"
     with tempfile.NamedTemporaryFile(dir=output, suffix=".parquet", delete=False) as stream:
         temporary = Path(stream.name)
     try:

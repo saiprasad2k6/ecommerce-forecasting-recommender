@@ -242,7 +242,9 @@ airflow dags unpause olist_batch_inference
 airflow dags trigger olist_batch_inference
 ```
 
-This runs both forecasting and recommendation inference with active models.
+This runs forecasting and recommendation inference with active models, then
+loads their Parquet outputs into `data/warehouse/predictions.duckdb` for SQL
+analysis in DBeaver. Loading runs only after both prediction tasks succeed.
 Defaults use `as_of=2018-08-01`, forecasting inputs from
 `data/features/forecasting/inference.parquet`, and recommendation history from
 `data/warehouse/olist.duckdb`. Override dates and paths in the trigger form for
@@ -251,7 +253,7 @@ another batch.
 Outputs are written under:
 
 ```text
-data/predictions/<task>/as_of=<date>/model_run_id=<id>/predictions.parquet
+data/predictions/<task>/as_of=<date>/model_run_id=<id>/batch_run_key=<run-key>/predictions.parquet
 ```
 
 Rows include the selected model and training run IDs. Forecasting uses features
@@ -282,6 +284,68 @@ Do not add `-v` unless you intend to delete the storage volumes. On subsequent
 starts, reactivate `.venv`, rerun `python scripts/storage/start_rustfs.py`, and
 start Airflow and MLflow as above. Existing versions can be restored with
 `dvc pull` after checking out their Git metadata and configuring storage.
+
+## Query predictions in DBeaver
+
+After both inference tasks succeed, `load_predictions` loads their Parquet outputs
+into **`data/warehouse/predictions.duckdb`**. This is separate from the Olist
+preparation warehouse. Repeated loads of the same batch do not duplicate rows.
+
+In DBeaver, create a **DuckDB** connection and select the absolute path to
+`data/warehouse/predictions.duckdb`. Expand its `main` schema to inspect:
+
+| Object | Contents |
+|---|---|
+| `prediction_runs` | Batch run IDs, as-of dates, timestamps and source metadata |
+| `forecast_predictions` | Stored demand predictions per product/state/date |
+| `recommendation_predictions` | Stored ranked product lists per customer |
+| `dim_product`, `dim_customer`, `dim_state` | Product/category and historical customer/state reference data |
+| `forecasts`, `recommendations` | Enriched views; recommendations are expanded with one-based rank |
+| `forecast_summary`, `recommendation_summary` | Demand and recommendation-frequency summary views |
+
+For example:
+
+```sql
+SELECT run_key, pipeline_run_id, as_of, run_timestamp, loaded_at
+FROM prediction_runs ORDER BY run_timestamp DESC;
+
+SELECT product_id, category, customer_state, state_name, target_date, prediction
+FROM forecasts ORDER BY prediction DESC LIMIT 100;
+
+SELECT customer_unique_id, customer_state, state_name, rank, product_id, category
+FROM recommendations
+WHERE customer_unique_id = 'REPLACE_WITH_CUSTOMER_ID'
+ORDER BY rank;
+```
+
+Filter by `run_key` to inspect a particular batch. See
+[example DBeaver queries](documentation/prediction-queries.sql).
+
+To load existing Parquet outputs manually:
+
+```bash
+source .venv/bin/activate
+python scripts/inference/load_predictions.py
+```
+
+Optional flags: `--predictions-dir`, `--reference-dir`, `--database`, and
+`--batch-run-id`. Defaults come from `configs/settings.yaml`. A targeted batch
+requires both prediction task outputs; a general backfill reports incomplete pairs
+and skips them. Loading is transactional and checks input hashes and duplicate
+keys. Changed predictions under an already loaded run ID are rejected.
+
+Disconnect DBeaver from this database before loading another batch, then reconnect.
+The loader explains conflicting DuckDB locks rather than modifying another
+process's database connection.
+
+Prediction rows are physically stored once in DuckDB; detail/summary views do not
+store extra copies. Original Parquet inference artifacts are retained, so the
+files and database both contain the predictions. Once loaded, SQL queries remain
+independent of those source files. No Streamlit application is included.
+Reference dimensions are captured from the cleaned CSVs at load time, with their
+hashes recorded. Recommendation customer location uses the latest order before
+`as_of`; unknown products/locations remain visible. Use matching cleaned reference
+files when importing historical batches.
 
 ## What each stage does
 
@@ -336,9 +400,10 @@ update; a failed activation restores the previous active model bytes. Operationa
 records under `data/activations/` identify the actual active model, including
 older models retained after a candidate is rejected.
 
-`olist_batch_inference` runs `predict_forecasting` followed by
-`predict_recommendation`. These tasks load approved active bundles and write
-Parquet predictions; they do not train or select models. Restored bundles can
+`olist_batch_inference` runs `predict_forecasting`, then
+`predict_recommendation`, then `load_predictions`. Prediction tasks load approved
+active bundles and write Parquet; the loader imports rows into the prediction
+DuckDB database and exposes product/state enrichment views. These tasks do not train or select models. Restored bundles can
 serve predictions without the historical MLflow database.
 
 ### Evaluation rules

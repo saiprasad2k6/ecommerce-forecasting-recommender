@@ -105,7 +105,19 @@ with tempfile.TemporaryDirectory() as directory:
     task = activation.get_task('activate_models')
     task.render_template_fields({'params': activation.params.validate()})
     assert task.env['TRAINING_RUN_ID'] == 'training__example'
-    assert bag.dags['olist_batch_inference'].task_ids == ['predict_forecasting','predict_recommendation']
+    assert bag.dags['olist_batch_inference'].task_ids == ['predict_forecasting','predict_recommendation','load_predictions']
+    inference_dag = bag.dags['olist_batch_inference']
+    assert inference_dag.get_task('load_predictions').upstream_task_ids == {'predict_recommendation'}
+    task = inference_dag.get_task('load_predictions')
+    task.render_template_fields({'params': inference_dag.params.validate(), 'run_id': 'batch__example'})
+    record = temporary / 'register.json'
+    subprocess.run(['bash', '-c', task.bash_command], cwd=task.cwd,
+        env={**os.environ, **task.env, 'TEST_RECORD_FILE': str(record)},
+        check=True, capture_output=True, text=True)
+    args = json.loads(record.read_text())
+    assert args[args.index('--batch-run-id') + 1] == 'batch__example'
+    assert task.trigger_rule == 'all_success'
+    assert 'olist_dashboard_preparation' not in bag.dags
     # Registering another model must extend the same Airflow workflow.
     other = temporary / 'project with spaces'
     (other / 'configs').mkdir(parents=True)

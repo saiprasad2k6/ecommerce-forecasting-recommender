@@ -53,7 +53,14 @@ class BatchInferenceTests(unittest.TestCase):
             selected = load_active_model("forecasting", root / "models")
             self.assertEqual(selected.serving_metadata["model_name"], "another_algorithm")
             again = run_pipeline("forecasting", date, source, root / "models", root / "predictions")
-            self.assertEqual(again["output"], second["output"])
+            self.assertNotEqual(again["output"], second["output"])
+            self.assertTrue(Path(second["output"]).exists())
+            before = Path(first["output"]).read_bytes()
+            # A retry with the same model and explicit run ID reuses its Parquet.
+            retry = run_pipeline("forecasting", date, source, root / "models", root / "predictions", "retry_001")
+            retry_again = run_pipeline("forecasting", date, source, root / "models", root / "predictions", "retry_001")
+            self.assertEqual(retry["output"], retry_again["output"])
+            self.assertEqual(Path(first["output"]).read_bytes(), before)
             self.assertTrue(pd.read_parquet(again["output"]).prediction.eq(9).all())
 
     def test_requires_serving_approval_and_matching_task(self):
