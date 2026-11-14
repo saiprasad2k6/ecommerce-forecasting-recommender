@@ -77,6 +77,10 @@ python scripts/storage/start_rustfs.py
 data/log volumes. The setup creates bucket `olist-dvc` and configures DVC remote
 `rustfs` at `s3://olist-dvc/cache`.
 
+```bash
+docker compose --env-file storage/.env -f storage/compose.yaml up -d
+```
+
 - Console: <http://127.0.0.1:19001>
 - S3 endpoint: <http://127.0.0.1:19000>
 - Private service credentials: `storage/.env`

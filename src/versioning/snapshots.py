@@ -22,9 +22,16 @@ import yaml
 from src.common.config import SETTINGS
 
 ROOT = Path(__file__).resolve().parents[2]
+SOURCE_PATHS = ("src", "scripts", "pipelines", "configs", "requirements.txt", "requirements-runtime.lock.txt")
+SPLIT_DATES = ("validation_start", "test_start", "monitoring_start", "monitoring_end")
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
 
 
 def write_json(path, value):
+    """Replace a manifest atomically so readers never see a partial JSON file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
@@ -47,7 +54,7 @@ def run_dir(run_id):
 
 
 def load_run(run_id):
-    result = json.loads((run_dir(run_id) / "manifest.json").read_text())
+    result = read_json(run_dir(run_id) / "manifest.json")
     if result["run_id"] != run_id:
         raise ValueError("Run ID mismatch")
     return result
@@ -65,11 +72,10 @@ def catalog_path(kind, version):
 
 def load_version(kind, version, committed=False):
     path = catalog_path(kind, version)
-    value = json.loads(path.read_text())
+    value = read_json(path)
     if value["version_id"] != version or value["kind"] != kind:
         raise ValueError("Catalog identity mismatch")
-    expected = identifier(value["identity"])
-    if expected != version:
+    if identifier(value["identity"]) != version:
         raise ValueError("Catalog contents do not match the version ID")
     if committed:
         require_committed(path)
@@ -78,23 +84,22 @@ def load_version(kind, version, committed=False):
 
 def digest_tree(path):
     path = Path(path)
-    paths = sorted(path.rglob("*")) if path.is_dir() else [path]
+    is_directory = path.is_dir()
+    paths = sorted(path.rglob("*")) if is_directory else [path]
     result = {}
     for item in paths:
         if item.is_symlink():
             raise ValueError(f"Versioned inputs cannot contain symlinks: {item}")
         if item.is_file():
             with item.open("rb") as stream:
-                result[str(item.relative_to(path)) if path.is_dir() else "."] = hashlib.file_digest(stream, "sha256").hexdigest()
+                result[str(item.relative_to(path)) if is_directory else "."] = hashlib.file_digest(stream, "sha256").hexdigest()
     if not result:
         raise ValueError(f"Missing or empty versioned input: {path}")
     return result
 
 
-def dvc(*args, output=False):
+def dvc(*args):
     command = [str(Path(sys.executable).with_name("dvc")), *map(str, args)]
-    if output:
-        return subprocess.check_output(command, cwd=ROOT).decode()
     subprocess.run(command, cwd=ROOT, check=True)
 
 
@@ -106,18 +111,26 @@ def provenance(release=False):
     dirty = bool(git("status", "--porcelain"))
     if release and dirty:
         raise ValueError("Release workflows require a clean Git checkout; commit code/configuration and published metadata first")
-    source_tree = git("ls-tree", "HEAD", "--", "src", "scripts", "pipelines", "configs", "requirements.txt", "requirements-runtime.lock.txt")
+    source_tree = git("ls-tree", "HEAD", "--", *SOURCE_PATHS)
     if release:
         validate_runtime_lock()
     packages = sorted(f"{p.metadata['Name']}=={p.version}" for p in distributions() if p.metadata.get("Name"))
     requirement_file = ROOT / "requirements.txt"
-    return {"git_commit": git("rev-parse", "HEAD"), "git_dirty": dirty,
-            "git_diff_sha256": hashlib.sha256(git("diff", "HEAD").encode()).hexdigest(),
-            "source_tree_sha256": hashlib.sha256(source_tree.encode()).hexdigest(),
-            "python": platform.python_version(), "platform": platform.platform(),
-            "requirements_sha256": hashlib.sha256(requirement_file.read_bytes()).hexdigest() if requirement_file.exists() else None,
-            "installed_packages": packages, "environment_sha256": identifier(packages),
-            "container_image_digest": os.environ.get("OLIST_IMAGE_DIGEST")}
+    return {
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_dirty": dirty,
+        "git_diff_sha256": hashlib.sha256(git("diff", "HEAD").encode()).hexdigest(),
+        "source_tree_sha256": hashlib.sha256(source_tree.encode()).hexdigest(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "requirements_sha256": (
+            hashlib.sha256(requirement_file.read_bytes()).hexdigest()
+            if requirement_file.exists() else None
+        ),
+        "installed_packages": packages,
+        "environment_sha256": identifier(packages),
+        "container_image_digest": os.environ.get("OLIST_IMAGE_DIGEST"),
+    }
 
 
 def validate_runtime_lock():
@@ -127,7 +140,8 @@ def validate_runtime_lock():
     if not path.exists():
         raise ValueError("Release workflows require requirements-runtime.lock.txt")
     for line in path.read_text().splitlines():
-        if not line.strip() or line.startswith("#"):
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
         requirement = Requirement(line)
         if requirement.marker and not requirement.marker.evaluate():
@@ -212,7 +226,9 @@ def verify_pointers(value, committed=False):
 
 
 def publish_checkpoint(kind, record):
-    files = {name: digest_tree(ROOT / path) for name, path in resources(kind).items()}
+    """Hash and upload the working files, then publish their catalog manifest."""
+    targets = resources(kind)
+    files = {name: digest_tree(ROOT / path) for name, path in targets.items()}
     identity = {"files": files}
     if kind == "raw":
         identity["dataset"] = SETTINGS["data"]["dataset"]
@@ -229,12 +245,12 @@ def publish_checkpoint(kind, record):
                  "producer_run_id": record["run_id"], "observed_at": datetime.now(timezone.utc).isoformat(),
                  "provenance": record["provenance"], "release": record["release"],
                  "preparation_steps": record.get("receipts", {}), "resources": {}}
-    for name, target in resources(kind).items():
+    for name, target in targets.items():
         pointer = metadata_dir() / kind / f"{name}.dvc"
         document = track(ROOT / target, pointer)
         value["resources"][name] = {"path": target, "pointer": str(pointer.relative_to(ROOT)), "dvc": document}
     # Catch an unmanaged writer even if upload itself succeeded.
-    if files != {name: digest_tree(ROOT / target) for name, target in resources(kind).items()}:
+    if files != {name: digest_tree(ROOT / target) for name, target in targets.items()}:
         raise ValueError("Inputs changed during publication; checkpoint not published")
     if kind == "prepared":
         value["raw_version"] = record["raw_version"]
@@ -293,14 +309,17 @@ def initialize_training(run_id, prepared_version, parameters, release=True):
     with workspace.locked("train:" + run_id, require_owner=True):
         verify_pointers(value, committed=True)
         verify_version(value)
-        feature_metadata = json.loads((ROOT / value["resources"]["forecasting"]["path"] / "metadata.json").read_text())
-        for key in ["validation_start", "test_start", "monitoring_start", "monitoring_end"]:
-            if key in feature_metadata.get("boundaries", {}) and feature_metadata["boundaries"][key] != parameters[key]:
+        feature_metadata = read_json(ROOT / value["resources"]["forecasting"]["path"] / "metadata.json")
+        boundaries = feature_metadata.get("boundaries", {})
+        for key in SPLIT_DATES:
+            if key in boundaries and boundaries[key] != parameters[key]:
                 raise ValueError(f"Prepared features do not match {key}; publish a matching prepared version")
         path = run_dir(run_id) / "manifest.json"
         if path.exists():
             existing = load_run(run_id)
-            if existing["prepared_version"] != prepared_version or existing["resolved_parameters"] != parameters or existing["release"] != release:
+            expected = {"prepared_version": prepared_version,
+                        "resolved_parameters": parameters, "release": release}
+            if any(existing[key] != value for key, value in expected.items()):
                 raise ValueError("A run ID cannot be reused with different parameters or versions")
             return existing
         value = {"run_id": run_id, "run_key": run_key(run_id), "prepared_version": prepared_version,
@@ -312,8 +331,7 @@ def initialize_training(run_id, prepared_version, parameters, release=True):
 
 def validate_run_context(manifest):
     current = provenance(False)
-    source_paths = ["src", "scripts", "pipelines", "configs", "requirements.txt", "requirements-runtime.lock.txt"]
-    if manifest["release"] and git("status", "--porcelain", "--", *source_paths):
+    if manifest["release"] and git("status", "--porcelain", "--", *SOURCE_PATHS):
         raise ValueError("Release source changed during the run")
     for key in ["source_tree_sha256", "environment_sha256", "python"]:
         if current[key] != manifest[key]:
@@ -331,7 +349,7 @@ def capture_artifacts(run_id):
         pointer = metadata_dir() / "runs" / run_key(run_id) / "artifacts.dvc"
         existing_receipt = pointer.parent / "manifest.json"
         if existing_receipt.exists():
-            receipt = json.loads(existing_receipt.read_text())
+            receipt = read_json(existing_receipt)
             if digest_tree(directory) != receipt["artifact_files"]:
                 raise ValueError("A preserved training run cannot be modified; create a new run ID")
             if hashlib.sha256(pointer.read_bytes()).hexdigest() != receipt["artifact_pointer_sha256"]:
@@ -349,7 +367,7 @@ def capture_artifacts(run_id):
 
 def lineage(run_id, committed=True):
     receipt_path = metadata_dir() / "runs" / run_key(run_id) / "manifest.json"
-    receipt = json.loads(receipt_path.read_text())
+    receipt = read_json(receipt_path)
     if committed:
         require_committed(receipt_path)
         require_committed(ROOT / receipt["artifact_dvc_pointer"])
@@ -375,39 +393,66 @@ def backup_mlflow():
     return str(destination)
 
 
-def main():
+def parse_arguments(argv):
+    """Validate CLI options and separate the preparation command after ``--``."""
     from src.versioning import workspace
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["begin-preparation", "execute-preparation", "raw", "prepared", "begin-training", "artifacts", "backup-mlflow", "release-workspace", "lineage"])
+    parser.add_argument("action", choices=[
+        "begin-preparation", "execute-preparation", "raw", "prepared",
+        "begin-training", "artifacts", "backup-mlflow", "release-workspace", "lineage",
+    ])
     parser.add_argument("--pipeline-run-id")
     parser.add_argument("--prepared-version")
     parser.add_argument("--kind", choices=["prepare", "train"])
     parser.add_argument("--stage", choices=workspace.PREPARATION_STAGES)
-    parser.add_argument("--development", action="store_true", help="Record a development run; production activation will reject it")
-    argv = sys.argv[1:]
+    parser.add_argument("--development", action="store_true",
+                        help="Record a development run; production activation will reject it")
     boundary = argv.index("--") if "--" in argv else len(argv)
-    command = argv[boundary + 1:] if boundary < len(argv) else []
     args = parser.parse_args(argv[:boundary])
+    command = argv[boundary + 1:]
     if args.action != "backup-mlflow" and not args.pipeline_run_id:
         parser.error("--pipeline-run-id is required")
-    parameters = {key: value for key, value in json.loads(os.environ.get("OLIST_PARAMETERS", "{}" )).items()
-                  if key not in ["release", "prepared_version"]}
-    if args.action == "begin-preparation":
-        result = workspace.reserve("prepare:" + args.pipeline_run_id, "preparation", args.pipeline_run_id, parameters, not args.development)
-    elif args.action == "execute-preparation":
-        if not args.stage or not command:
-            parser.error("--stage and -- COMMAND are required")
-        result = workspace.execute_preparation(args.pipeline_run_id, args.stage, command)
-    elif args.action == "raw": result = publish_raw(args.pipeline_run_id)
-    elif args.action == "prepared": result = publish_prepared(args.pipeline_run_id)
-    elif args.action == "begin-training":
-        if not args.prepared_version: parser.error("--prepared-version is required")
-        result = initialize_training(args.pipeline_run_id, args.prepared_version, parameters, not args.development)
-    elif args.action == "artifacts": result = capture_artifacts(args.pipeline_run_id)
-    elif args.action == "lineage": result = lineage(args.pipeline_run_id)
-    elif args.action == "backup-mlflow": result = backup_mlflow()
-    else:
-        if not args.kind: parser.error("--kind is required")
-        result = workspace.release(args.kind + ":" + args.pipeline_run_id)
+    required_option = {
+        "execute-preparation": "stage",
+        "begin-training": "prepared_version",
+        "release-workspace": "kind",
+    }.get(args.action)
+    if required_option and not getattr(args, required_option):
+        parser.error(f"--{required_option.replace('_', '-')} is required")
+    if args.action == "execute-preparation" and not command:
+        parser.error("-- COMMAND is required")
+    return args, command
+
+
+def main():
+    from src.versioning import workspace
+
+    args, command = parse_arguments(sys.argv[1:])
+    run_id = args.pipeline_run_id
+    parameters = {
+        key: value for key, value in json.loads(os.environ.get("OLIST_PARAMETERS", "{}")).items()
+        if key not in ("release", "prepared_version")
+    }
+    release = not args.development
+    match args.action:
+        case "begin-preparation":
+            result = workspace.reserve("prepare:" + run_id, "preparation", run_id, parameters, release)
+        case "execute-preparation":
+            result = workspace.execute_preparation(run_id, args.stage, command)
+        case "raw":
+            result = publish_raw(run_id)
+        case "prepared":
+            result = publish_prepared(run_id)
+        case "begin-training":
+            result = initialize_training(run_id, args.prepared_version, parameters, release)
+        case "artifacts":
+            result = capture_artifacts(run_id)
+        case "lineage":
+            result = lineage(run_id)
+        case "backup-mlflow":
+            result = backup_mlflow()
+        case "release-workspace":
+            result = workspace.release(args.kind + ":" + run_id)
     print(json.dumps(result, indent=2))
     return 0
