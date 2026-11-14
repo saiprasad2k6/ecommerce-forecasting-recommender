@@ -1,0 +1,6 @@
+outs:
+- path: ../../data/features/forecasting
+  md5: a112e0cda84cc9bc1a5781324dadbd0e.dir
+  size: 75724992
+  nfiles: 5
+  hash: md5

@@ -1,0 +1,5 @@
+outs:
+- path: ../../data/validation/raw.json
+  md5: 4586bd0d15b2b90ac95c6818478d0dee
+  size: 1227
+  hash: md5

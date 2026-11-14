@@ -1,0 +1,5 @@
+outs:
+- path: ../../data/warehouse/olist.duckdb
+  md5: fec0b053d51cf6456937fa8fc562848e
+  size: 36450304
+  hash: md5
