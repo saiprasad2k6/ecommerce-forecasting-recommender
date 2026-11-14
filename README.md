@@ -13,8 +13,9 @@ restored.
 
 The default dates replay historical data: validation starts in June 2018, testing
 in July, and inference/monitoring inputs in August. This is a local MLOps workflow
-for one shared workspace on macOS/Linux. Live API serving, monitoring jobs and
-automatic retraining are not implemented.
+for one shared workspace on macOS/Linux. A local FastAPI service supports
+request-time inference from activated models. Monitoring jobs and automatic
+retraining are not implemented.
 
 ## Environment setup
 
@@ -346,6 +347,27 @@ Reference dimensions are captured from the cleaned CSVs at load time, with their
 hashes recorded. Recommendation customer location uses the latest order before
 `as_of`; unknown products/locations remain visible. Use matching cleaned reference
 files when importing historical batches.
+
+## Request predictions through FastAPI
+
+With models activated, start the local HTTP service:
+
+```bash
+source .venv/bin/activate
+python -m uvicorn api.app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Open <http://127.0.0.1:8000/docs> for Swagger UI and request examples. Endpoints:
+
+- `GET /health`: HTTP liveness.
+- `GET /v1/models`: active model identities and availability.
+- `POST /v1/inference/forecast`: next-day demand for product/state pairs.
+- `POST /v1/inference/recommendations`: ranked products for one customer.
+
+The API uses prepared features and historical warehouse data, and returns the
+actual serving model's provenance. It does not write responses to Parquet or
+DuckDB. See [API instructions](api/README.md) and the
+[Swagger/OpenAPI contract](documentation/inference-openapi.yaml).
 
 ## What each stage does
 

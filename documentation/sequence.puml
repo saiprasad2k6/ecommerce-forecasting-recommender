@@ -1,0 +1,153 @@
+@startuml sequence
+!theme plain
+skinparam shadowing false
+hide footbox
+
+title Olist release lifecycle - preparation, training, activation and inference
+
+actor Operator as user
+participant "Airflow DAGs" as airflow
+participant "Preparation / training CLIs" as jobs
+participant "snapshot.py\nVersioning + workspace guard" as snapshot
+participant "Git" as git
+collections "Local datasets\nand run artifacts" as files
+participant "DVC + RustFS" as storage
+participant "MLflow" as mlflow
+participant "Activation service" as activation
+collections "Active bundles\n+ activation records" as active
+participant "Batch inference" as inference
+
+== Preparation ==
+user -> airflow : Trigger olist_data_preparation
+ airflow -> snapshot : begin-preparation(run_id, parameters)
+snapshot -> git : Check clean checkout; record source fingerprint
+snapshot -> snapshot : Validate runtime lock; reserve workspace\nRecord Python / package environment
+
+loop Download, then validate
+  airflow -> snapshot : execute-preparation(stage, command)
+  snapshot -> jobs : Run stage under ownership guard
+  jobs -> files : Download / reuse CSVs; validate schema
+  jobs --> snapshot : Successful completion / validation report
+  snapshot -> files : Promote staged outputs where applicable
+  snapshot -> snapshot : Record stage receipt
+end
+
+airflow -> snapshot : raw(preparation_run_id)
+snapshot -> files : Hash raw CSVs and validation report
+snapshot -> storage : DVC add + push
+storage --> snapshot : Upload succeeds
+snapshot -> files : Write raw pointers and catalog (version A)
+
+loop Clean, curate, forecast features, recommendation example
+  airflow -> snapshot : execute-preparation(stage, command)
+  snapshot -> jobs : Check stage order; run with staged outputs
+  jobs -> files : Produce cleaned / curated tables, warehouse, features
+  jobs --> snapshot : Success
+  snapshot -> files : Promote outputs
+  snapshot -> snapshot : Record stage receipt
+end
+
+airflow -> snapshot : prepared(preparation_run_id)
+snapshot -> files : Verify raw A; hash prepared resources
+snapshot -> storage : DVC add + push warehouse and forecast features
+storage --> snapshot : Upload succeeds
+snapshot -> files : Write prepared pointers and catalog\nVersion B links to raw A, parameters and code
+ airflow -> snapshot : release-workspace(kind=prepare)
+ snapshot --> airflow : Release ownership
+ airflow --> user : Preparation succeeds; prepared_version B
+
+user -> git : Review and commit raw / prepared pointers + catalogs
+note over user,git
+  Metadata commits are manual. File bytes are already uploaded.
+  A local commit is required before training consumes this version.
+end note
+
+== Training and evaluation ==
+user -> airflow : Trigger olist_model_training(prepared_version=B)
+airflow -> snapshot : begin-training(training_run_id, B, parameters)
+snapshot -> git : Verify committed prepared / raw catalogs\nand prepared pointers; check release source
+snapshot -> snapshot : Validate runtime lock; reserve workspace
+snapshot -> files : Verify prepared hashes and split dates\nWrite run manifest with provenance
+
+loop Forecast / recommendation baselines and registered candidates
+  airflow -> jobs : run_job(training_run_id, task, model)
+  jobs -> snapshot : Check workspace ownership and run context
+  jobs -> files : Verify consumed inputs; train / evaluate
+  jobs -> files : Save model, metrics, report and job index
+  jobs -> mlflow : Log parameters, validation/test metrics, artifacts\nand raw/prepared/code provenance tags
+end
+
+airflow -> jobs : compare_models(training_run_id)
+jobs -> files : Read completed job reports and models
+jobs -> jobs : Select on validation; apply test veto
+jobs -> files : Write selection/decisions.json\nand serving-ready selection/models/ bundles
+jobs -> mlflow : Log comparison decisions and selected artifacts
+
+airflow -> snapshot : artifacts(training_run_id)
+snapshot -> snapshot : Verify unchanged source / environment
+snapshot -> files : Require comparison decisions
+snapshot -> storage : DVC add + push immutable run directory
+storage --> snapshot : Upload succeeds
+snapshot -> files : Write run pointer and receipt\nModel C links to prepared B and raw A
+ airflow -> snapshot : backup-mlflow
+snapshot -> mlflow : Back up SQLite with SQLite backup API
+snapshot -> files : Write backups/mlflow/<timestamp>.db
+ airflow -> snapshot : release-workspace(kind=train)
+ airflow --> user : Training succeeds; record training_run_id
+
+user -> mlflow : Review metrics and comparison decisions
+user -> git : Review and commit snapshots/runs/<run-key>/
+
+== Activation ==
+user -> airflow : Trigger olist_model_activation(training_run_id)
+airflow -> activation : activate_run(training_run_id)
+activation -> snapshot : Acquire workspace lock; require no conflicting owner
+activation -> git : Require clean source and committed release metadata
+activation -> activation : Compare source fingerprint and environment\nwith recorded training provenance
+activation -> snapshot : Validate committed model -> prepared -> raw lineage
+activation -> files : Verify artifact pointer and full run hashes
+
+alt A release verification fails
+  activation --> airflow : Fail before installing models
+else All release checks pass
+  activation -> files : Load preserved selection bundles and decisions
+  alt Candidate approved
+    activation -> active : Install candidate
+  else Candidate rejected and an active model exists
+    activation -> active : Retain existing model
+  else Candidate rejected on first deployment
+    activation -> active : Install selected baseline fallback
+  end
+  alt Installation / audit succeeds
+    activation -> active : Record actual active model, run IDs and file hashes
+    activation --> airflow : Activation succeeds
+  else Installation / audit fails
+    activation -> active : Restore previous model bytes
+    activation --> airflow : Activation fails
+  end
+end
+
+note over activation,mlflow
+  Activation currently does not update an MLflow active alias.
+  Inspect actual deployment through active bundle metadata
+  and data/activations/*.json.
+end note
+
+== Batch inference (after successful activation) ==
+user -> airflow : Trigger olist_batch_inference(as_of, inputs)
+loop Forecasting, then recommendation
+  airflow -> inference : Predict using active model
+  inference -> snapshot : Acquire workspace lock
+  inference -> active : Load bundle; check serving approval and task
+  inference -> files : Read dated forecast features / historical warehouse
+  inference -> inference : Predict next-day demand / customer recommendations
+  inference -> files : Write predictions.parquet\nInclude model and training run IDs
+end
+ airflow --> user : Batch predictions available under data/predictions/
+
+note over airflow,snapshot
+  Preparation and training release ownership after success or failure.
+  Their failure watcher prevents cleanup from masking a failed workflow.
+  Failed processing / uploads stop the successful release path shown here.
+end note
+@enduml

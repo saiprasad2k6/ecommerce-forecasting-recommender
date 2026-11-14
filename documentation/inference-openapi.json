@@ -1,0 +1,613 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Olist Inference API",
+    "description": "Request-time inference using activated model bundles. Forecasts read prepared features for as_of and predict the following day. Recommendations use delivered history before as_of. Responses identify the actual serving model. Requests do not train models or write batch predictions to DuckDB.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Operations"
+        ],
+        "summary": "Check that the HTTP service is running",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "Operations"
+        ],
+        "summary": "Inspect the activated models and check serving readiness",
+        "operationId": "active_models",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Model/input unavailable, invalid, locked, or workspace busy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/inference/forecast": {
+      "post": {
+        "tags": [
+          "Inference"
+        ],
+        "summary": "Forecast next-day product/state demand",
+        "operationId": "forecast_demand",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForecastRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForecastResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested prepared features or historical data were not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request fields or recommendation k.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Model/input unavailable, invalid, locked, or workspace busy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/inference/recommendations": {
+      "post": {
+        "tags": [
+          "Inference"
+        ],
+        "summary": "Recommend ranked products for one customer",
+        "description": "Unknown customers use the active model's cold-start behavior. Fewer than k products may be returned if the catalog is smaller. No scores are exposed.",
+        "operationId": "recommend_products",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecommendationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecommendationResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested prepared features or historical data were not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request fields or recommendation k.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Model/input unavailable, invalid, locked, or workspace busy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorDetail"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse"
+      },
+      "ForecastItem": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^\\S+$",
+            "title": "Product Id"
+          },
+          "customer_state": {
+            "type": "string",
+            "enum": [
+              "AC",
+              "AL",
+              "AP",
+              "AM",
+              "BA",
+              "CE",
+              "DF",
+              "ES",
+              "GO",
+              "MA",
+              "MT",
+              "MS",
+              "MG",
+              "PA",
+              "PB",
+              "PR",
+              "PE",
+              "PI",
+              "RJ",
+              "RN",
+              "RS",
+              "RO",
+              "RR",
+              "SC",
+              "SP",
+              "SE",
+              "TO"
+            ],
+            "title": "Customer State"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "product_id",
+          "customer_state"
+        ],
+        "title": "ForecastItem"
+      },
+      "ForecastPrediction": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^\\S+$",
+            "title": "Product Id"
+          },
+          "customer_state": {
+            "type": "string",
+            "enum": [
+              "AC",
+              "AL",
+              "AP",
+              "AM",
+              "BA",
+              "CE",
+              "DF",
+              "ES",
+              "GO",
+              "MA",
+              "MT",
+              "MS",
+              "MG",
+              "PA",
+              "PB",
+              "PR",
+              "PE",
+              "PI",
+              "RJ",
+              "RN",
+              "RS",
+              "RO",
+              "RR",
+              "SC",
+              "SP",
+              "SE",
+              "TO"
+            ],
+            "title": "Customer State"
+          },
+          "target_date": {
+            "type": "string",
+            "format": "date",
+            "title": "Target Date"
+          },
+          "prediction": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Prediction",
+            "description": "Estimated demand, not observed sales."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "product_id",
+          "customer_state",
+          "target_date",
+          "prediction"
+        ],
+        "title": "ForecastPrediction"
+      },
+      "ForecastRequest": {
+        "properties": {
+          "as_of": {
+            "type": "string",
+            "format": "date",
+            "title": "As Of",
+            "description": "Prepared feature date; predicts demand for the following day."
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ForecastItem"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Items"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "as_of",
+          "items"
+        ],
+        "title": "ForecastRequest",
+        "example": {
+          "as_of": "2018-08-01",
+          "items": [
+            {
+              "customer_state": "SP",
+              "product_id": "0c44cf18fca971245b41119ce72861c0"
+            }
+          ]
+        }
+      },
+      "ForecastResponse": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Generated At"
+          },
+          "as_of": {
+            "type": "string",
+            "format": "date",
+            "title": "As Of"
+          },
+          "model": {
+            "$ref": "#/components/schemas/ModelInfo"
+          },
+          "predictions": {
+            "items": {
+              "$ref": "#/components/schemas/ForecastPrediction"
+            },
+            "type": "array",
+            "title": "Predictions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "generated_at",
+          "as_of",
+          "model",
+          "predictions"
+        ],
+        "title": "ForecastResponse"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "HealthResponse"
+      },
+      "ModelInfo": {
+        "properties": {
+          "task": {
+            "type": "string",
+            "enum": [
+              "forecasting",
+              "recommendation"
+            ],
+            "title": "Task"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "model_role": {
+            "type": "string",
+            "enum": [
+              "baseline",
+              "candidate"
+            ],
+            "title": "Model Role"
+          },
+          "model_run_id": {
+            "type": "string",
+            "title": "Model Run Id"
+          },
+          "training_pipeline_run_id": {
+            "type": "string",
+            "title": "Training Pipeline Run Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "task",
+          "model_name",
+          "model_role",
+          "model_run_id",
+          "training_pipeline_run_id"
+        ],
+        "title": "ModelInfo"
+      },
+      "ModelsResponse": {
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelInfo"
+            },
+            "type": "array",
+            "title": "Models"
+          }
+        },
+        "type": "object",
+        "required": [
+          "models"
+        ],
+        "title": "ModelsResponse"
+      },
+      "RecommendationRequest": {
+        "properties": {
+          "as_of": {
+            "type": "string",
+            "format": "date",
+            "title": "As Of",
+            "description": "Use delivered purchase history strictly before this date."
+          },
+          "customer_unique_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^\\S+$",
+            "title": "Customer Unique Id"
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "K",
+            "description": "Number of recommendations; defaults to the active model's k. Must not exceed its candidate limit."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "as_of",
+          "customer_unique_id"
+        ],
+        "title": "RecommendationRequest",
+        "example": {
+          "as_of": "2018-08-01",
+          "customer_unique_id": "0000366f3b9a7992bf8c76cfdf3221e2",
+          "k": 10
+        }
+      },
+      "RecommendationResponse": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Generated At"
+          },
+          "as_of": {
+            "type": "string",
+            "format": "date",
+            "title": "As Of"
+          },
+          "customer_unique_id": {
+            "type": "string",
+            "title": "Customer Unique Id"
+          },
+          "k": {
+            "type": "integer",
+            "title": "K"
+          },
+          "cold_start": {
+            "type": "boolean",
+            "title": "Cold Start"
+          },
+          "model": {
+            "$ref": "#/components/schemas/ModelInfo"
+          },
+          "recommendations": {
+            "items": {
+              "$ref": "#/components/schemas/RecommendedProduct"
+            },
+            "type": "array",
+            "title": "Recommendations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "generated_at",
+          "as_of",
+          "customer_unique_id",
+          "k",
+          "cold_start",
+          "model",
+          "recommendations"
+        ],
+        "title": "RecommendationResponse"
+      },
+      "RecommendedProduct": {
+        "properties": {
+          "rank": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Rank"
+          },
+          "product_id": {
+            "type": "string",
+            "title": "Product Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rank",
+          "product_id"
+        ],
+        "title": "RecommendedProduct"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Operations"
+    },
+    {
+      "name": "Inference"
+    }
+  ]
+}
