@@ -58,18 +58,32 @@ with tempfile.TemporaryDirectory() as directory:
     training.params.get_param('prepared_version').resolve('a' * 64)
     params = training.params.validate()
     params.update(max_train_rows=1000, forecast_estimators=5, release=True)
+    training_run_id = 'training__example"; touch "' + str(temporary / 'training_injected') + '"; echo "'
     for task in training.topological_sort():
         if task.task_id == 'workflow_failed': continue
-        task.render_template_fields({'params': params, 'run_id': 'training__example'})
+        task.render_template_fields({'params': params, 'run_id': training_run_id})
         record = temporary / (task.task_id + '.json')
         subprocess.run(['bash', '-c', task.bash_command], cwd=task.cwd,
             env={**os.environ, **task.env, 'TEST_RECORD_FILE': str(record)}, check=True, capture_output=True, text=True)
         args = json.loads(record.read_text())
         assert Path(args[0]).is_file()
+        if task.task_id == 'backup_mlflow':
+            assert args[1:] == ['backup-mlflow']
+        else:
+            assert args[args.index('--pipeline-run-id') + 1] == training_run_id
+        if task.task_id.startswith(('evaluate_', 'train_')):
+            model_task = args[args.index('--task') + 1]
+            model = args[args.index('--model') + 1]
+            assert model_task in registered
+            assert model == 'baselines' or model in registered[model_task]
+        if task.task_id == 'release_workspace':
+            assert args[1] == 'release-workspace'
+            assert args[args.index('--kind') + 1] == 'train'
         if task.task_id == 'select_prepared_version':
             assert args[args.index('--prepared-version') + 1] == 'a' * 64
             assert '--development' not in args
             assert json.loads(task.env['OLIST_PARAMETERS'])['max_train_rows'] == 1000
+    assert not (temporary / 'training_injected').exists()
     marker = temporary / 'must_not_exist'
     customer = 'customer"; touch "' + str(marker) + '"; echo "'
     params = data.params.validate()
@@ -104,6 +118,19 @@ with tempfile.TemporaryDirectory() as directory:
     dag = expanded.dags['olist_model_training']
     assert 'train_forecasting_challenger' in dag.task_ids
     assert 'train_forecasting_challenger' in dag.get_task('release_workspace').upstream_task_ids
+    dag.params.get_param('prepared_version').resolve('b' * 64)
+    params = dag.params.validate()
+    params['release'] = False
+    task = dag.get_task('select_prepared_version')
+    task.render_template_fields({'params': params, 'run_id': 'development__example'})
+    record = temporary / 'development.json'
+    subprocess.run(['bash', '-c', task.bash_command], cwd=task.cwd,
+        env={**os.environ, **task.env, 'TEST_RECORD_FILE': str(record)},
+        check=True, capture_output=True, text=True)
+    args = json.loads(record.read_text())
+    assert args[1] == 'begin-training'
+    assert args.count('--development') == 1
+    assert args[args.index('--prepared-version') + 1] == 'b' * 64
 '''
         result = subprocess.run([sys.executable, "-c", check], cwd=root, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

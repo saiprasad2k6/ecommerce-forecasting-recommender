@@ -22,7 +22,10 @@ import yaml
 from src.common.config import SETTINGS
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE_PATHS = ("src", "scripts", "pipelines", "configs", "requirements.txt", "requirements-runtime.lock.txt")
+SOURCE_PATHS = (
+    "src", "scripts", "pipelines", "configs",
+    "requirements.txt", "requirements-runtime.lock.txt",
+)
 SPLIT_DATES = ("validation_start", "test_start", "monitoring_start", "monitoring_end")
 
 
@@ -225,32 +228,57 @@ def verify_pointers(value, committed=False):
             require_committed(pointer)
 
 
-def publish_checkpoint(kind, record):
-    """Hash and upload the working files, then publish their catalog manifest."""
-    targets = resources(kind)
-    files = {name: digest_tree(ROOT / path) for name, path in targets.items()}
+def resource_hashes(targets):
+    """Hash each named workspace resource for publication and verification."""
+    return {name: digest_tree(ROOT / path) for name, path in targets.items()}
+
+
+def checkpoint_identity(kind, files, record):
+    """Describe the inputs that determine a raw or prepared version ID."""
     identity = {"files": files}
     if kind == "raw":
         identity["dataset"] = SETTINGS["data"]["dataset"]
     else:
-        identity.update(raw_version=record["raw_version"], parameters=record["parameters"],
-                        preparation_git_commit=record["provenance"]["git_commit"])
+        identity.update(
+            raw_version=record["raw_version"],
+            parameters=record["parameters"],
+            preparation_git_commit=record["provenance"]["git_commit"],
+        )
+    return identity
+
+
+def publish_checkpoint(kind, record):
+    """Hash and upload the working files, then publish their catalog manifest."""
+    targets = resources(kind)
+    files = resource_hashes(targets)
+    identity = checkpoint_identity(kind, files, record)
     version = identifier(identity)
     path = catalog_path(kind, version)
     if path.exists():
         value = load_version(kind, version)
         verify_version(value)
     else:
-        value = {"kind": kind, "version_id": version, "identity": identity,
-                 "producer_run_id": record["run_id"], "observed_at": datetime.now(timezone.utc).isoformat(),
-                 "provenance": record["provenance"], "release": record["release"],
-                 "preparation_steps": record.get("receipts", {}), "resources": {}}
+        value = {
+            "kind": kind,
+            "version_id": version,
+            "identity": identity,
+            "producer_run_id": record["run_id"],
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "provenance": record["provenance"],
+            "release": record["release"],
+            "preparation_steps": record.get("receipts", {}),
+            "resources": {},
+        }
     for name, target in targets.items():
         pointer = metadata_dir() / kind / f"{name}.dvc"
         document = track(ROOT / target, pointer)
-        value["resources"][name] = {"path": target, "pointer": str(pointer.relative_to(ROOT)), "dvc": document}
+        value["resources"][name] = {
+            "path": target,
+            "pointer": str(pointer.relative_to(ROOT)),
+            "dvc": document,
+        }
     # Catch an unmanaged writer even if upload itself succeeded.
-    if files != {name: digest_tree(ROOT / target) for name, target in targets.items()}:
+    if files != resource_hashes(targets):
         raise ValueError("Inputs changed during publication; checkpoint not published")
     if kind == "prepared":
         value["raw_version"] = record["raw_version"]
@@ -259,6 +287,7 @@ def publish_checkpoint(kind, record):
 
 
 def publish_raw(run_id):
+    """Publish validated raw inputs, or verify the checkpoint on a retry."""
     from src.versioning import workspace
     with workspace.locked("prepare:" + run_id, require_owner=True) as record:
         if record["completed"][:2] != workspace.PREPARATION_STAGES[:2]:
@@ -275,6 +304,7 @@ def publish_raw(run_id):
 
 
 def publish_prepared(run_id):
+    """Publish completed preparation outputs linked to their verified raw inputs."""
     from src.versioning import workspace
     with workspace.locked("prepare:" + run_id, require_owner=True) as record:
         if record["completed"] != workspace.PREPARATION_STAGES or "raw_version" not in record:
@@ -296,37 +326,56 @@ def training_parameters(parameters):
     return {**defaults, **parameters}
 
 
+def verify_training_inputs(prepared, parameters):
+    """Require committed pointers, matching files and matching split dates."""
+    verify_pointers(prepared, committed=True)
+    verify_version(prepared)
+    features = ROOT / prepared["resources"]["forecasting"]["path"]
+    boundaries = read_json(features / "metadata.json").get("boundaries", {})
+    for key in SPLIT_DATES:
+        if key in boundaries and boundaries[key] != parameters[key]:
+            raise ValueError(
+                f"Prepared features do not match {key}; publish a matching prepared version"
+            )
+
+
 def initialize_training(run_id, prepared_version, parameters, release=True):
     """Select a published version; never infer the latest dataset or copy it."""
     from src.versioning import workspace
     parameters = training_parameters(parameters)
-    value = load_version("prepared", prepared_version, committed=True)
-    raw = load_version("raw", value["raw_version"], committed=True)
-    if release and (not value["release"] or not raw["release"]):
+    prepared = load_version("prepared", prepared_version, committed=True)
+    raw = load_version("raw", prepared["raw_version"], committed=True)
+    if release and (not prepared["release"] or not raw["release"]):
         raise ValueError("Release training cannot consume development-only checkpoints")
-    record = workspace.reserve("train:" + run_id, "training", run_id,
-                               {"prepared_version": prepared_version, **parameters}, release)
+    record = workspace.reserve(
+        "train:" + run_id, "training", run_id,
+        {"prepared_version": prepared_version, **parameters}, release,
+    )
     with workspace.locked("train:" + run_id, require_owner=True):
-        verify_pointers(value, committed=True)
-        verify_version(value)
-        feature_metadata = read_json(ROOT / value["resources"]["forecasting"]["path"] / "metadata.json")
-        boundaries = feature_metadata.get("boundaries", {})
-        for key in SPLIT_DATES:
-            if key in boundaries and boundaries[key] != parameters[key]:
-                raise ValueError(f"Prepared features do not match {key}; publish a matching prepared version")
+        verify_training_inputs(prepared, parameters)
         path = run_dir(run_id) / "manifest.json"
         if path.exists():
             existing = load_run(run_id)
-            expected = {"prepared_version": prepared_version,
-                        "resolved_parameters": parameters, "release": release}
-            if any(existing[key] != value for key, value in expected.items()):
+            expected = {
+                "prepared_version": prepared_version,
+                "resolved_parameters": parameters,
+                "release": release,
+            }
+            if any(existing[key] != expected_value for key, expected_value in expected.items()):
                 raise ValueError("A run ID cannot be reused with different parameters or versions")
             return existing
-        value = {"run_id": run_id, "run_key": run_key(run_id), "prepared_version": prepared_version,
-                 "raw_version": raw["version_id"], "prepared_manifest": str(catalog_path("prepared", prepared_version).relative_to(ROOT)),
-                 "resolved_parameters": parameters, "release": release, **record["provenance"]}
-        write_json(path, value)
-        return value
+        manifest = {
+            "run_id": run_id,
+            "run_key": run_key(run_id),
+            "prepared_version": prepared_version,
+            "raw_version": raw["version_id"],
+            "prepared_manifest": str(catalog_path("prepared", prepared_version).relative_to(ROOT)),
+            "resolved_parameters": parameters,
+            "release": release,
+            **record["provenance"],
+        }
+        write_json(path, manifest)
+        return manifest
 
 
 def validate_run_context(manifest):
@@ -339,6 +388,7 @@ def validate_run_context(manifest):
 
 
 def capture_artifacts(run_id):
+    """Upload an evaluated run once; reject changes to an already preserved run."""
     from src.versioning import workspace
     with workspace.locked("train:" + run_id, require_owner=True):
         directory = run_dir(run_id)
@@ -358,14 +408,20 @@ def capture_artifacts(run_id):
             return receipt["model_version"]
         document = track(directory, pointer)
         model_version = identifier({"prepared_version": manifest["prepared_version"], "dvc": document})
-        receipt = {**manifest, "model_version": model_version, "artifact_dvc_pointer": str(pointer.relative_to(ROOT)),
-                   "artifact_pointer_sha256": hashlib.sha256(pointer.read_bytes()).hexdigest(),
-                   "artifact_files": digest_tree(directory), "uploaded_remote": SETTINGS["versioning"]["remote"]}
+        receipt = {
+            **manifest,
+            "model_version": model_version,
+            "artifact_dvc_pointer": str(pointer.relative_to(ROOT)),
+            "artifact_pointer_sha256": hashlib.sha256(pointer.read_bytes()).hexdigest(),
+            "artifact_files": digest_tree(directory),
+            "uploaded_remote": SETTINGS["versioning"]["remote"],
+        }
         write_json(pointer.parent / "manifest.json", receipt)
         return model_version
 
 
 def lineage(run_id, committed=True):
+    """Resolve and validate the model -> prepared -> raw metadata chain."""
     receipt_path = metadata_dir() / "runs" / run_key(run_id) / "manifest.json"
     receipt = read_json(receipt_path)
     if committed:
@@ -375,10 +431,16 @@ def lineage(run_id, committed=True):
     raw = load_version("raw", prepared["raw_version"], committed)
     if raw["version_id"] != receipt["raw_version"]:
         raise ValueError("Broken raw -> prepared -> model lineage")
-    return {"raw": raw["version_id"], "prepared": prepared["version_id"], "model": receipt["model_version"], "run_id": run_id}
+    return {
+        "raw": raw["version_id"],
+        "prepared": prepared["version_id"],
+        "model": receipt["model_version"],
+        "run_id": run_id,
+    }
 
 
 def backup_mlflow():
+    """Create a consistent, timestamped backup of the SQLite tracking database."""
     from src.models.common import TRACKING_URI
     if not TRACKING_URI.startswith("sqlite:///"):
         raise ValueError("Configure native database backups for a non-SQLite tracking server")
@@ -425,34 +487,45 @@ def parse_arguments(argv):
     return args, command
 
 
-def main():
-    from src.versioning import workspace
-
-    args, command = parse_arguments(sys.argv[1:])
-    run_id = args.pipeline_run_id
-    parameters = {
-        key: value for key, value in json.loads(os.environ.get("OLIST_PARAMETERS", "{}")).items()
+def environment_parameters():
+    """Read workflow parameters, excluding options handled by the CLI."""
+    parameters = json.loads(os.environ.get("OLIST_PARAMETERS", "{}"))
+    return {
+        key: value for key, value in parameters.items()
         if key not in ("release", "prepared_version")
     }
+
+
+def execute_action(args, command):
+    """Dispatch a validated CLI action and return its JSON-serializable result."""
+    from src.versioning import workspace
+
+    run_id = args.pipeline_run_id
+    parameters = environment_parameters()
     release = not args.development
     match args.action:
         case "begin-preparation":
-            result = workspace.reserve("prepare:" + run_id, "preparation", run_id, parameters, release)
+            return workspace.reserve("prepare:" + run_id, "preparation", run_id, parameters, release)
         case "execute-preparation":
-            result = workspace.execute_preparation(run_id, args.stage, command)
+            return workspace.execute_preparation(run_id, args.stage, command)
         case "raw":
-            result = publish_raw(run_id)
+            return publish_raw(run_id)
         case "prepared":
-            result = publish_prepared(run_id)
+            return publish_prepared(run_id)
         case "begin-training":
-            result = initialize_training(run_id, args.prepared_version, parameters, release)
+            return initialize_training(run_id, args.prepared_version, parameters, release)
         case "artifacts":
-            result = capture_artifacts(run_id)
+            return capture_artifacts(run_id)
         case "lineage":
-            result = lineage(run_id)
+            return lineage(run_id)
         case "backup-mlflow":
-            result = backup_mlflow()
+            return backup_mlflow()
         case "release-workspace":
-            result = workspace.release(args.kind + ":" + run_id)
+            return workspace.release(args.kind + ":" + run_id)
+
+
+def main():
+    args, command = parse_arguments(sys.argv[1:])
+    result = execute_action(args, command)
     print(json.dumps(result, indent=2))
     return 0

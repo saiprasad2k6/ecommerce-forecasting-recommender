@@ -1,12 +1,365 @@
 # E-commerce forecasting and recommendations
 
-An Olist MLOps project with Airflow execution, DVC file versioning, RustFS object
-storage, MLflow experiment tracking, and gated model activation. Forecasting uses
-next-day product/state demand; recommendation models use historical customer
-snapshots. The managed workflow supports one shared local workspace on macOS/Linux.
-It is not a distributed storage or high-availability deployment by itself.
+This project uses the Brazilian Olist e-commerce dataset to answer two questions:
+how much demand should we expect tomorrow for each product and customer state,
+and which products should we recommend to a customer based on their history?
 
-## Responsibilities and layout
+It covers the workflow from downloading raw data to generating batch predictions.
+Airflow runs preparation, training, activation and inference. LightGBM candidates
+are evaluated against simple baselines before they can become active models.
+MLflow records experiments; DVC and RustFS preserve datasets and model artifacts;
+Git records code, configuration and version metadata so a run can be traced and
+restored.
+
+The default dates replay historical data: validation starts in June 2018, testing
+in July, and inference/monitoring inputs in August. This is a local MLOps workflow
+for one shared workspace on macOS/Linux. Live API serving, monitoring jobs and
+automatic retraining are not implemented.
+
+## Environment setup
+
+### 1. Install prerequisites and Python dependencies
+
+Use Python 3.12, Git, Docker Engine with Docker Compose, and any native libraries
+required by LightGBM. On Windows, use a Linux environment such as WSL: workspace
+locking depends on Unix `fcntl`.
+
+Run all commands below from the project root:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-runtime.lock.txt
+python -m pip check
+```
+
+The runtime lock reproduces the Python environment used for release work.
+For notebook development, `requirements.txt` also includes optional notebook tools:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Use the runtime lock for release runs. Activate `.venv` in each new terminal.
+
+### 2. Configure Kaggle access
+
+Provide Kaggle credentials using `~/.kaggle/kaggle.json` or the
+`KAGGLE_API_TOKEN` environment variable. They must be available to the Airflow
+worker that downloads `olistbr/brazilian-ecommerce`.
+
+Review `configs/settings.yaml` for dataset paths, replay dates, training limits,
+estimator counts and recommendation settings. Candidate models are registered in
+`configs/production_models.json`.
+
+### 3. Configure DVC and start RustFS
+
+The checkout normally already contains `.dvc/`. Only if DVC has not been
+initialized, run:
+
+```bash
+dvc init
+dvc remote add -d rustfs s3://olist-dvc/cache
+dvc remote modify rustfs region us-east-1
+dvc config cache.type reflink,copy
+dvc config core.analytics false
+```
+
+Ensure `.dvc/.gitignore` retains its generated entries and also includes:
+
+```gitignore
+/workspace.json
+/workspace.lock
+/snapshot.lock
+```
+
+Start Docker Desktop or Docker Engine, then run:
+
+```bash
+python scripts/storage/start_rustfs.py
+dvc version
+dvc remote list
+docker compose --env-file storage/.env -f storage/compose.yaml ps
+```
+
+The setup script starts `rustfs/rustfs:1.0.0`, creates bucket `olist-dvc`, and
+configures the `rustfs` DVC remote at `s3://olist-dvc/cache`. It generates or reuses
+private credentials in `storage/.env` and writes private DVC settings to
+`.dvc/config.local`. Both files are Git-ignored. The `permissions` container
+exiting with code 0 is expected; it sets volume ownership before RustFS starts.
+
+| Service | Address |
+|---|---|
+| RustFS console | <http://127.0.0.1:19001> |
+| RustFS S3 endpoint | <http://127.0.0.1:19000> |
+
+Use the credentials in `storage/.env` to access the console. To change ports, set
+`RUSTFS_API_PORT` / `RUSTFS_CONSOLE_PORT` in that file and rerun the setup script.
+Commit shared DVC configuration changes through the normal review process; keep
+credential files private.
+
+## Run the project in order
+
+Follow this sequence for a release that can be activated. Release preparation and
+training require a clean Git checkout, so review and commit your intended code,
+configuration and README changes before starting. Wait for each DAG to succeed
+before moving to the next step.
+
+For experiments with uncommitted source, preparation and training accept
+`--conf '{"release":false}'` (include `prepared_version` for training). Development
+training still needs committed input metadata, and development runs cannot be
+activated. Use the release path below when you need batch predictions.
+
+### 1. Start Airflow — terminal 1
+
+```bash
+source .venv/bin/activate
+export AIRFLOW_HOME="$PWD/airflow"
+export AIRFLOW__CORE__DAGS_FOLDER="$PWD/pipelines"
+export AIRFLOW__CORE__LOAD_EXAMPLES=False
+airflow standalone
+```
+
+Keep this terminal running. Open the Airflow address printed at startup and sign
+in using the generated credentials. This starts the local development Airflow
+services and loads the DAGs from `pipelines/`.
+
+### 2. Prepare a command terminal — terminal 2
+
+```bash
+source .venv/bin/activate
+export AIRFLOW_HOME="$PWD/airflow"
+export AIRFLOW__CORE__DAGS_FOLDER="$PWD/pipelines"
+export AIRFLOW__CORE__LOAD_EXAMPLES=False
+airflow dags list
+```
+
+Wait for the project DAGs to appear. If a DAG is paused, unpause it in the UI or
+with the relevant `airflow dags unpause` command below.
+
+### 3. Prepare the data
+
+```bash
+airflow dags unpause olist_data_preparation
+airflow dags trigger olist_data_preparation
+```
+
+Follow the run in the Airflow UI. It downloads or reuses the raw CSVs, validates
+and cleans them, builds the warehouse and features, and uploads raw and prepared
+versions to RustFS through DVC.
+
+After the DAG succeeds, find the 64-character prepared version ID in the
+`publish_prepared_version` task log or the corresponding filename under
+`snapshots/catalog/prepared/`. Select the version produced by this run.
+
+### 4. Publish the dataset metadata to Git
+
+Review the generated changes, then commit the raw/prepared pointers and catalogs
+together:
+
+```bash
+git diff -- snapshots/raw snapshots/prepared snapshots/catalog
+git status --short
+git add snapshots/raw snapshots/prepared snapshots/catalog
+git commit -m "Publish raw and prepared Olist dataset versions"
+```
+
+Airflow uploads file contents but does not commit or push Git metadata. Publish
+the commit to your team's remote through the normal release process. Training
+requires the selected version's metadata to be committed in Git HEAD.
+
+### 5. Train and evaluate models
+
+Replace the placeholder with the prepared version from step 3:
+
+```bash
+airflow dags unpause olist_model_training
+airflow dags trigger olist_model_training \
+  --conf '{"prepared_version":"REPLACE_WITH_64_CHARACTER_PREPARED_VERSION"}'
+```
+
+Wait for success. Record the original Airflow training run ID shown in the UI;
+activation uses this exact ID. The workflow evaluates baselines, trains registered
+candidates, compares them, uploads the run artifacts and backs up MLflow.
+Training does not replace the active models.
+
+The trigger form also exposes row limits, estimator counts, seed, date cutoffs,
+candidate limits and Top K. Defaults come from `configs/settings.yaml`; split
+parameters must match the selected prepared version.
+
+### 6. Inspect the results in MLflow — terminal 3
+
+```bash
+source .venv/bin/activate
+mlflow ui --backend-store-uri sqlite:///data/baselines/mlflow.db --port 5000
+```
+
+Open <http://localhost:5000>. Inspect parameters, validation/test metrics,
+artifacts and comparison decisions in `ecommerce-demand-forecasting` and
+`ecommerce-recommendations`. Keep this terminal running while using the UI;
+press `Ctrl+C` to stop it. You can also start MLflow while training is running.
+
+### 7. Publish the model-run metadata
+
+Return to terminal 2. Find the matching run manifest under
+`snapshots/runs/<run-key>/manifest.json`: the run key is a hash of the training
+run ID, not the original Airflow ID. Review that run's metadata, then replace
+`RUN_KEY` below:
+
+```bash
+git status --short
+git add snapshots/runs/RUN_KEY
+git commit -m "Publish evaluated Olist model run"
+```
+
+Publish the commit through the normal release process before activation.
+
+### 8. Activate the evaluated model selection
+
+Replace the placeholder with the original training run ID from step 5:
+
+```bash
+airflow dags unpause olist_model_activation
+airflow dags trigger olist_model_activation \
+  --conf '{"training_run_id":"ORIGINAL_TRAINING_RUN_ID"}'
+```
+
+Wait for success. Activation checks committed metadata, lineage, artifact hashes,
+source and environment before updating `models/`. A candidate that passes the
+gates replaces the active model. A rejected candidate retains an existing model,
+or installs the selected baseline on the first deployment.
+
+The equivalent single operation, when Airflow orchestration is unnecessary, is:
+
+```bash
+python scripts/models/activate_models.py --pipeline-run-id ORIGINAL_TRAINING_RUN_ID
+```
+
+### 9. Generate batch predictions
+
+```bash
+airflow dags unpause olist_batch_inference
+airflow dags trigger olist_batch_inference
+```
+
+This runs both forecasting and recommendation inference with active models.
+Defaults use `as_of=2018-08-01`, forecasting inputs from
+`data/features/forecasting/inference.parquet`, and recommendation history from
+`data/warehouse/olist.duckdb`. Override dates and paths in the trigger form for
+another batch.
+
+Outputs are written under:
+
+```text
+data/predictions/<task>/as_of=<date>/model_run_id=<id>/predictions.parquet
+```
+
+Rows include the selected model and training run IDs. Forecasting uses features
+on `as_of` to predict the next day's demand. Recommendations use history before
+`as_of`.
+
+To run only forecasting directly:
+
+```bash
+python scripts/inference/run_batch.py --task forecasting --as-of 2018-08-01 \
+  --input-path data/features/forecasting/inference.parquet --models-dir models \
+  --output-dir data/predictions
+```
+
+For recommendation inference, use `--task recommendation` and
+`--input-path data/warehouse/olist.duckdb`.
+
+### 10. Stop local services when finished
+
+Stop Airflow and MLflow with `Ctrl+C` in their terminals. Stop RustFS without
+deleting its stored objects:
+
+```bash
+docker compose --env-file storage/.env -f storage/compose.yaml down
+```
+
+Do not add `-v` unless you intend to delete the storage volumes. On subsequent
+starts, reactivate `.venv`, rerun `python scripts/storage/start_rustfs.py`, and
+start Airflow and MLflow as above. Existing versions can be restored with
+`dvc pull` after checking out their Git metadata and configuring storage.
+
+## What each stage does
+
+### Data preparation: `olist_data_preparation`
+
+| Stage | Purpose and output |
+|---|---|
+| `begin_preparation` | Reserves the shared workspace and records preparation parameters. |
+| `download_olist_data` | Downloads Olist CSVs into `data/raw/`; complete local downloads are normally reused. |
+| `validate_olist_data` | Checks raw files against `configs/schema.yaml` and writes `data/validation/raw.json`. |
+| `publish_raw_version` | Uploads raw files and validation results through DVC and records their content-based version. |
+| `clean_olist_data` | Produces cleaned working tables under `data/processed/`. |
+| `prepare_curated_data` | Builds curated tables in `data/curated/` and the DuckDB warehouse at `data/warehouse/olist.duckdb`. |
+| `build_forecasting_features` | Builds temporal forecasting features and split metadata under `data/features/forecasting/`. |
+| `build_recommendation_features` | Writes an inspectable customer recommendation example under `data/features/recommendations/`; training examples are built from the warehouse. |
+| `publish_prepared_version` | Verifies preparation receipts and raw hashes, then uploads forecasting inputs and the warehouse with links to the raw version. |
+| `release_workspace` | Releases workflow ownership after success or failure. |
+
+Stages promote temporary outputs only after success. Failed processing retains
+previous working outputs; failed uploads cannot publish a completed checkpoint.
+For fresh Kaggle files, use the managed download CLI with `--force`, or refresh
+`data/raw/` only when no workflow owns the workspace, then rerun preparation.
+
+### Training: `olist_model_training`
+
+| Stage | Purpose and output |
+|---|---|
+| `select_prepared_version` | Reserves the workspace and verifies the explicitly selected committed prepared version, parent raw version, input hashes and split parameters. |
+| `evaluate_forecasting_baselines` | Evaluates last-day, weekly, moving-average and seasonal rules; `always_zero` is diagnostic only. |
+| `evaluate_recommendation_baselines` | Evaluates global popularity, category popularity and purchase-history rules. |
+| `train_forecasting_lightgbm` | Trains the registered LightGBM demand candidate and evaluates validation/test periods. |
+| `train_recommendation_lightgbm_ranker` | Trains the registered LightGBM ranking candidate on historical customer examples. |
+| `compare_models` | Selects candidates on validation, applies the test veto, and creates serving bundles and decisions under the run's `selection/` directory. |
+| `preserve_run_snapshot` | Uploads the immutable run artifacts through DVC and writes the run pointer and manifest. |
+| `backup_mlflow` | Backs up the tracking SQLite database to `backups/mlflow/`. |
+| `release_workspace` | Releases workflow ownership after success or failure. |
+
+Candidate task names come from `configs/production_models.json`. Both preparation
+and training also have a `workflow_failed` watcher so cleanup cannot hide an
+upstream failure.
+
+Training artifacts live under
+`data/runs/<hash-of-run-id>/training/<task>/<model>/`. Job indexes identify
+completed attempts; comparison uses those saved reports and models. Every new
+training attempt needs a new run ID. Preserved runs cannot be modified in place.
+
+### Activation and inference
+
+`olist_model_activation` runs `activate_models`: it verifies the preserved run
+and installs its selection in `models/`. Managed inference is locked during the
+update; a failed activation restores the previous active model bytes. Operational
+records under `data/activations/` identify the actual active model, including
+older models retained after a candidate is rejected.
+
+`olist_batch_inference` runs `predict_forecasting` followed by
+`predict_recommendation`. These tasks load approved active bundles and write
+Parquet predictions; they do not train or select models. Restored bundles can
+serve predictions without the historical MLflow database.
+
+### Evaluation rules
+
+Forecasting predicts next-day demand using past-only features. Labels crossing
+split boundaries are purged, and evaluation covers the full validation/test
+periods. A candidate must improve validation MAE without worse RMSE and produce
+varying predictions. `always_zero` cannot win baseline selection.
+
+Recommendation models use separate historical training, validation, test and
+monitoring periods. Availability cutoffs exclude future deliveries and customer
+history. A candidate must improve Recall@K without worse Precision@K; cold-start
+customers use popularity fallback. For both tasks, test can veto the selected
+winner but does not choose another candidate.
+
+## Repository and operations reference
+
+The sections below describe file ownership, version identities, recovery and
+advanced CLI usage after the main workflow is familiar.
+
+## Repository layout
 
 | Location/tool | Responsibility |
 |---|---|
@@ -27,117 +380,6 @@ It is not a distributed storage or high-availability deployment by itself.
 Airflow is the only workflow executor. There is no executable `dvc.yaml` pipeline
 or separate DVC training runner. DVC is called at publication checkpoints.
 
-## Installation
-
-Use Python 3.12, Git, Docker Engine and Docker Compose. The process lock uses
-Unix `fcntl`; on Windows use a Linux environment such as WSL. Native library
-requirements, including those needed by LightGBM, must also be available.
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-# Exact installed Python environment used for release work:
-python -m pip install -r requirements-runtime.lock.txt
-python -m pip check
-```
-
-`requirements.txt` groups direct dependencies and retains supporting pins. It also
-includes optional notebook tools that are not part of the installed release lock:
-
-```bash
-# Development / notebooks:
-python -m pip install -r requirements.txt
-```
-
-## DVC and storage setup
-
-Run these commands from the project root with `.venv` activated. DVC and its S3
-support are included in the project requirements installed above.
-
-For a new checkout without `.dvc/`, initialize DVC and register the RustFS remote:
-
-```bash
-dvc init
-dvc remote add -d rustfs s3://olist-dvc/cache
-dvc remote modify rustfs region us-east-1
-dvc config cache.type reflink,copy
-dvc config core.analytics false
-```
-
-Skip this initialization block when the checkout already contains the DVC
-configuration. See [DVC initialization](https://doc.dvc.org/command-reference/init)
-and [DVC configuration](https://doc.dvc.org/command-reference/config).
-
-Ensure `.dvc/.gitignore` includes these project-specific temporary files, keeping
-the entries generated by `dvc init`:
-
-```gitignore
-/workspace.json
-/workspace.lock
-/snapshot.lock
-```
-
-Start Docker Desktop (or Docker Engine), then initialize RustFS:
-
-```bash
-python scripts/storage/start_rustfs.py
-```
-
-`storage/compose.yaml` runs the official `rustfs/rustfs:1.0.0` image with persistent
-data/log volumes. The setup script starts the services in detached mode, generates
-or reuses credentials in `storage/.env`, creates bucket `olist-dvc`, and configures
-the endpoint and credentials for remote `rustfs` in `.dvc/config.local`.
-
-Verify the setup:
-
-```bash
-dvc version
-dvc remote list
-docker compose --env-file storage/.env -f storage/compose.yaml ps
-```
-
-The remote list should include `rustfs` pointing to `s3://olist-dvc/cache`.
-The `permissions` container exiting with code 0 is expected: it sets volume
-ownership once before RustFS starts.
-
-On subsequent starts, use the setup script again or start the existing services:
-
-```bash
-docker compose --env-file storage/.env -f storage/compose.yaml up -d
-```
-
-- Console: <http://127.0.0.1:19001>
-- S3 endpoint: <http://127.0.0.1:19000>
-- Private service credentials: `storage/.env`
-- Private DVC credentials: `.dvc/config.local`
-
-Both credential files are Git-ignored. Override local ports using
-`RUSTFS_API_PORT` / `RUSTFS_CONSOLE_PORT` in `storage/.env`.
-Rerun the setup script after changing the API port to update the DVC endpoint.
-
-Commit `.dvc/config`, `.dvc/.gitignore`, and `.dvcignore` through the normal Git
-review process. Keep `storage/.env` and `.dvc/config.local` private. Release
-workflows require a clean Git checkout; for local development, trigger Airflow
-with `release=false`.
-
-Airflow publishes data and model files through the snapshot scripts, which run
-`dvc add` and `dvc push`. To restore already published files, check out the desired
-release metadata, configure storage as above, then run:
-
-```bash
-dvc pull
-```
-
-```bash
-# Stop without deleting stored objects; do not add -v unless deletion is intended.
-docker compose --env-file storage/.env -f storage/compose.yaml down
-```
-
-DVC uses `reflink,copy`: copy-on-write links where supported, physical copies
-otherwise. There is no custom second full dataset under `data/snapshots/`.
-DVC still needs local cache/workspace storage; reflink availability is filesystem
-specific. Never replace these with ordinary writable hard links casually.
-See [DVC cache optimization](https://doc.dvc.org/user-guide/data-management/large-dataset-optimization).
 
 ## Versions and lineage
 
@@ -186,110 +428,6 @@ use a checkout containing the desired release metadata and `dvc pull` first.
 Multiple model runs can use the same prepared version without making another
 physical dataset snapshot.
 
-## Preparation and metadata publication
-
-Configure Kaggle credentials for the worker with `~/.kaggle/kaggle.json` or
-`KAGGLE_API_TOKEN`. Default paths, replay dates and model settings are in
-`configs/settings.yaml`. Start a local development Airflow instance from the root:
-
-```bash
-export AIRFLOW_HOME="$PWD/airflow"
-export AIRFLOW__CORE__DAGS_FOLDER="$PWD/pipelines"
-export AIRFLOW__CORE__LOAD_EXAMPLES=False
-airflow standalone
-```
-
-Trigger `olist_data_preparation`. Its tasks are:
-
-```text
-begin_preparation → download → validate → publish_raw_version
-  → clean → curate → forecasting_features → recommendation_features
-  → publish_prepared_version → release_workspace
-```
-
-Processing tasks use temporary stage outputs. A task promotes its outputs only
-after successful execution; a failure retains previous working outputs and cannot
-publish a completed checkpoint. Preparation receipts enforce stage order. Raw
-hashes are checked again before prepared publication to establish the parent link.
-Upload must succeed before a new live pointer/catalog entry is published.
-
-A version becomes consumable only after its metadata is committed through the
-normal review/release process. Airflow does not commit or push Git automatically:
-
-```bash
-# After preparation succeeds, review the changes and record all checkpoint metadata.
-git add snapshots/raw snapshots/prepared snapshots/catalog
-git commit -m "Publish raw and prepared Olist dataset versions"
-# Push the commit to your team's Git remote through the normal release process.
-```
-
-Read the prepared version ID from the `publish_prepared_version` task output or
-its catalog filename. The preparation manifest records its producing run ID.
-
-For fresh Kaggle files, use the download task's managed CLI with `--force`, or
-refresh `data/raw/` only while no workflow owns the workspace, then run the whole
-preparation DAG. Do not train from an incompletely prepared working directory.
-
-## Training and model release
-
-Trigger `olist_model_training` with the published prepared ID:
-
-```bash
-airflow dags trigger olist_model_training \
-  --conf '{"prepared_version":"REPLACE_WITH_64_CHARACTER_PREPARED_VERSION"}'
-```
-
-The trigger form exposes row limits, estimator counts, seed, replay cutoffs,
-candidate limits and Top K. Defaults come from YAML. Its tasks are:
-
-```text
-select_prepared_version
-  → forecasting_baselines → recommendation_baselines
-  → registered candidate jobs → compare_models
-  → preserve_run_snapshot → backup_mlflow → release_workspace
-```
-
-Every job reads the selected working input version under the shared lease. The run
-manifest resolves the paths through that version's catalog; no training input
-files are copied. Each job checks the hashes of the resource it consumes.
-
-Artifacts are isolated under `data/runs/<hash-of-run-id>/training/<task>/<model>/`.
-Job indexes identify completed attempts; comparison uses their saved reports and
-models. Run manifests and MLflow tags record raw/prepared IDs, code provenance,
-environment and actual resolved parameters. A new training attempt requires a new
-run ID. A preserved run cannot be modified in place.
-
-Comparison selects on validation and uses test only as a release veto. It prepares
-serving-ready bundles under `selection/models/` and reports under `selection/`;
-it does not change `models/`. The DVC run checkpoint preserves models, all training
-artifacts, manifests and decisions. The MLflow database is backed up separately.
-
-After training succeeds, review and commit that run's uploaded metadata:
-
-```bash
-git add snapshots/runs/RUN_KEY
-git commit -m "Publish evaluated Olist model run"
-```
-
-Then trigger the separate activation DAG:
-
-```bash
-airflow dags trigger olist_model_activation \
-  --conf '{"training_run_id":"ORIGINAL_TRAINING_RUN_ID"}'
-# Equivalent single operation:
-python scripts/models/activate_models.py --pipeline-run-id ORIGINAL_TRAINING_RUN_ID
-```
-
-Activation requires committed run metadata, complete lineage, unchanged uploaded
-artifact hashes, a clean matching source tree, and the same Python environment.
-Development runs are rejected. An approved candidate replaces the active model;
-a rejected candidate retains an existing model or installs the selected baseline
-on the first deployment. Managed inference is locked during activation, and a
-failed activation restores previous active model bytes.
-
-Operational records in `data/activations/` describe the actual active selection
-and file hash for each task, including retained older models. They are separate
-from immutable training artifacts; back them up with operational state.
 
 ## Workspace isolation, retries and crash recovery
 
@@ -323,6 +461,7 @@ This is a single-host/shared-filesystem contract, not a distributed lock service
 For concurrent production workers, use isolated workspaces materialized from
 explicit DVC versions and a scheduler/service coordinating publication. Do not
 mount unrelated local directories and assume this lease coordinates them.
+
 
 ## Individual CLI operations
 
@@ -364,6 +503,7 @@ Airflow for the full workflow. `--development` is supported on begin operations;
 Airflow exposes the equivalent `release=false`. Development still requires
 committed input metadata but permits uncommitted source and cannot activate models.
 
+
 ## Recovery and lineage audit
 
 Use a separate checkout for historical recovery rather than changing the source
@@ -383,45 +523,16 @@ that the referenced data can actually be materialized. Activation additionally
 checks the full local artifact hashes. Restoring models and running inference do
 not require the old MLflow database.
 
-After activation, trigger `olist_batch_inference`, or specify inputs explicitly:
-
-```bash
-python scripts/inference/run_batch.py --task forecasting --as-of 2018-08-01 \
-  --input-path data/features/forecasting/inference.parquet --models-dir models \
-  --output-dir data/predictions
-```
-
-Recommendation inference takes `data/warehouse/olist.duckdb` as `--input-path`.
-Predictions include selected model and training run IDs. There is no live API
-serving or automatic monitoring/retraining deployment implemented here.
-
-## Models and evaluation
+## Adding a candidate model
 
 `configs/production_models.json` registers candidate modules and maps their
-parameters. Airflow creates one task per registered model; `run_job.py` calls its
-shared `run_pipeline()` function. Add an implementation under
-`src/models/<task>/`, its CLI entry point under `scripts/models/<task>/`, and a
-registry entry. Reuse shared datasets/evaluation and `common.save_run()`.
+parameters. Add an implementation under `src/models/<task>/`, a CLI entry point
+under `scripts/models/<task>/`, and a registry entry. Airflow creates a task for
+each registered model; `run_job.py` calls its shared `run_pipeline()` function.
+Reuse shared datasets, evaluation and `common.save_run()`.
 
-Forecasting exposes `predict(feature_frame)` and predicts demand for the next day.
-Features are past-only; labels crossing split boundaries are purged. Evaluation
-uses full validation/test periods. `always_zero` is diagnostic and excluded from
-baseline selection. Candidates must improve validation MAE without worse RMSE and
-must produce varying predictions. Test can veto the selected winner; it does not
-choose another candidate.
-
-Recommendations expose `predict(snapshot, customer_id, k)`. Historical training,
-validation, test and monitoring periods are separate; availability cutoffs exclude
-future deliveries/history. Candidates must improve Recall@K without worse
-Precision@K. Cold-start customers use popularity fallback. Defaults reserve August
-2018 for inference/monitoring; they do not represent a live inventory system.
-
-MLflow stores matching evaluation fingerprints and grouped run IDs, validation/test
-metrics, parameters, artifacts and comparison decisions. View local experiments:
-
-```bash
-mlflow ui --backend-store-uri sqlite:///data/baselines/mlflow.db --port 5000
-```
+Forecasting models expose `predict(feature_frame)`; recommendation models expose
+`predict(snapshot, customer_id, k)`.
 
 ## Storage durability, backups and retention
 
@@ -447,6 +558,7 @@ operation, never an Airflow task; account for all retained commits, tags, branch
 and repositories sharing the remote before deleting anything. See
 [DVC GC](https://doc.dvc.org/command-reference/gc) and
 [DVC remote storage](https://doc.dvc.org/user-guide/data-management/remote-storage).
+
 
 ## Verification and cleanup
 

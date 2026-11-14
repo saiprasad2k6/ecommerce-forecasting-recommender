@@ -1,4 +1,9 @@
-"""Manual model training DAG; run olist_data_preparation first."""
+"""Airflow 3 DAG: train, evaluate and preserve models from a prepared version.
+
+Run olist_data_preparation and commit its snapshot metadata before training.
+Override OLIST_PROJECT_ROOT / OLIST_PYTHON when deploying outside this checkout.
+No training or dataset access happens when the scheduler parses this file.
+"""
 
 from datetime import datetime, timedelta, timezone
 import json
@@ -16,26 +21,44 @@ from airflow.sdk import DAG, Param, chain
 ROOT = Path(os.environ.get("OLIST_PROJECT_ROOT", Path(__file__).resolve().parents[1])).resolve()
 SETTINGS = yaml.safe_load((ROOT / "configs/settings.yaml").read_text())
 REPLAY = SETTINGS["replay"]
-PROJECT_PYTHON = ROOT / ".venv/bin/python"
+PROJECT_PYTHON = ROOT / ".venv" / "bin" / "python"
 PYTHON = os.environ.get("OLIST_PYTHON", str(PROJECT_PYTHON) if PROJECT_PYTHON.is_file() else sys.executable)
+SPLIT_DATES = ("training_start", "validation_start", "test_start", "monitoring_start")
 MODEL_JOBS = json.loads((ROOT / "configs/production_models.json").read_text())
 
 
-def training_task(task_id, script, arguments="", *, env=None,
-                  run_id=True, trigger_rule="all_success"):
-    """Run a project CLI; dynamic values use quoted environment variables."""
-    command = shlex.join([PYTHON, str(ROOT / "scripts" / script)])
+def script_task(task_id: str, script: str, *arguments: str,
+                parameters: dict[str, str] | None = None,
+                env: dict[str, str] | None = None, run_id: bool = True,
+                trigger_rule: str = "all_success") -> BashOperator:
+    """Quote literal arguments and pass trigger parameters through shell variables.
+
+    ``parameters`` maps CLI flag names to Airflow parameter names.
+    Model CLIs enforce workspace ownership using the training run manifest.
+    """
+    command = shlex.join([PYTHON, str(ROOT / "scripts" / script), *arguments])
+    environment = {"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
+                   "PIPELINE_RUN_ID": "{{ run_id }}", **(env or {})}
+    for flag, parameter in (parameters or {}).items():
+        variable = "OLIST_" + parameter.upper()
+        environment[variable] = "{{ params." + parameter + " }}"
+        command += f' --{flag} "${variable}"'
     if run_id:
         command += ' --pipeline-run-id "$PIPELINE_RUN_ID"'
+    if script == "versioning/snapshot.py" and arguments[0] == "begin-training":
+        command += ' {{ "" if params.release else "--development" }}'
     return BashOperator(
         task_id=task_id,
-        bash_command=f'export PATH={shlex.quote(str(Path(PYTHON).parent))}:"$PATH"\nexec {command} {arguments}',
-        cwd=str(ROOT),
-        env={"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
-             "PIPELINE_RUN_ID": "{{ run_id }}", **(env or {})},
-        append_env=True, do_xcom_push=False, skip_on_exit_code=None,
-        trigger_rule=trigger_rule,
+        bash_command=f'export PATH={shlex.quote(str(Path(PYTHON).parent))}:"$PATH"\nexec {command}',
+        cwd=str(ROOT), env=environment, append_env=True,
+        do_xcom_push=False, skip_on_exit_code=None, trigger_rule=trigger_rule,
     )
+
+
+def snapshot_task(task_id: str, action: str, *arguments: str, **kwargs) -> BashOperator:
+    """Manage training checkpoints; MLflow backup does not take a run ID."""
+    return script_task(task_id, "versioning/snapshot.py", action, *arguments,
+                       run_id=action != "backup-mlflow", **kwargs)
 
 
 with DAG(
@@ -56,8 +79,7 @@ with DAG(
     params={
         "prepared_version": Param(type="string", pattern="^[0-9a-f]{64}$", description="Published prepared version ID; no latest-data fallback"),
         "release": Param(SETTINGS["release"]["require_clean_git"], type="boolean"),
-        **{name: Param(REPLAY[name], type="string", format="date") for name in
-           ["training_start", "validation_start", "test_start", "monitoring_start"]},
+        **{name: Param(REPLAY[name], type="string", format="date") for name in SPLIT_DATES},
         "max_train_rows": Param(SETTINGS["training"]["max_train_rows"], type="integer", minimum=2),
         "forecast_estimators": Param(SETTINGS["training"]["forecast_estimators"], type="integer", minimum=1),
         "ranking_estimators": Param(SETTINGS["training"]["ranking_estimators"], type="integer", minimum=1),
@@ -73,27 +95,25 @@ with DAG(
     """,
 ) as dag:
     steps = [
-        training_task("select_prepared_version", "versioning/snapshot.py",
-                      'begin-training --prepared-version "$PREPARED_VERSION" '
-                      '{{ "" if params.release else "--development" }}',
-                      env={"OLIST_PARAMETERS": "{{ params | tojson }}",
-                           "PREPARED_VERSION": "{{ params.prepared_version }}"}),
+        snapshot_task("select_prepared_version", "begin-training",
+                      parameters={"prepared-version": "prepared_version"},
+                      env={"OLIST_PARAMETERS": "{{ params | tojson }}"}),
         *[
-            training_task(f"evaluate_{task}_baselines", "models/run_job.py",
-                          shlex.join(["--task", task, "--model", "baselines"]))
+            script_task(f"evaluate_{task}_baselines", "models/run_job.py",
+                        "--task", task, "--model", "baselines")
             for task in ("forecasting", "recommendation")
         ],
         *[
-            training_task(f"train_{task}_{model}", "models/run_job.py",
-                          shlex.join(["--task", task, "--model", model]))
+            script_task(f"train_{task}_{model}", "models/run_job.py",
+                        "--task", task, "--model", model)
             for task, models in MODEL_JOBS.items() for model in models
         ],
-        training_task("compare_models", "models/comparison/compare_models.py"),
-        training_task("preserve_run_snapshot", "versioning/snapshot.py", "artifacts"),
-        training_task("backup_mlflow", "versioning/snapshot.py", "backup-mlflow", run_id=False),
+        script_task("compare_models", "models/comparison/compare_models.py"),
+        snapshot_task("preserve_run_snapshot", "artifacts"),
+        snapshot_task("backup_mlflow", "backup-mlflow"),
     ]
-    release = training_task("release_workspace", "versioning/snapshot.py",
-                            "release-workspace --kind train", trigger_rule="all_done")
+    release = snapshot_task("release_workspace", "release-workspace", "--kind", "train",
+                            trigger_rule="all_done")
     watcher = BashOperator(task_id="workflow_failed", bash_command="exit 1",
                            trigger_rule="one_failed", retries=0)
     chain(*steps)
