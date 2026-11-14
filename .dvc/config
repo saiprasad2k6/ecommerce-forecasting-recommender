@@ -1,0 +1,8 @@
+[core]
+    remote = rustfs
+    analytics = false
+[cache]
+    type = "reflink,copy"
+['remote "rustfs"']
+    url = s3://olist-dvc/cache
+    region = us-east-1

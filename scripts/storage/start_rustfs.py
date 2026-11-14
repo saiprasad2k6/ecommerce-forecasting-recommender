@@ -8,12 +8,34 @@ import sys
 import time
 
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError, ConnectionClosedError
+from botocore.exceptions import (
+    ClientError, ConnectionClosedError, ConnectTimeoutError,
+    EndpointConnectionError, ReadTimeoutError,
+)
 from botocore.session import get_session
 from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parents[2]
 STORAGE = ROOT / "storage"
+
+
+def wait_for_storage(client, attempts=120):
+    """Wait for S3 readiness, including temporary HTTP errors during startup."""
+    for attempt in range(attempts):
+        try:
+            client.list_buckets()
+            return
+        except (ClientError, EndpointConnectionError, ConnectionClosedError,
+                ConnectTimeoutError, ReadTimeoutError) as error:
+            if isinstance(error, ClientError):
+                status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if status not in {429, 500, 502, 503, 504}:
+                    raise
+            if attempt == attempts - 1:
+                raise RuntimeError(
+                    "RustFS did not become ready; inspect the rustfs container logs."
+                ) from error
+            time.sleep(1)
 
 
 def main():
@@ -38,14 +60,7 @@ def main():
         config=Config(connect_timeout=1, read_timeout=2, retries={"max_attempts": 0},
                       s3={"addressing_style": "path"}),
     )
-    for attempt in range(120):
-        try:
-            client.list_buckets()
-            break
-        except (EndpointConnectionError, ConnectionClosedError):
-            if attempt == 119:
-                raise
-            time.sleep(1)
+    wait_for_storage(client)
     try:
         client.head_bucket(Bucket="olist-dvc")
     except ClientError as error:
